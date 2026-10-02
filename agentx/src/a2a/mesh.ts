@@ -1,0 +1,667 @@
+import type { MeshPeer, DaemonConfig } from "@/daemon/config"
+import type { AgentCard, AgentSkill } from "./types"
+import { A2AClient } from "./client"
+import { Agent as UndiciAgent, fetch as undiciFetch } from "undici"
+import { getEventBus } from "@/events/bus"
+import { newEventId, type RootContext } from "@/events/envelope"
+
+// --- A2A Mesh: peer discovery, health checks, agent directory ---
+
+/** Custom undici dispatcher used by sendTask: peer agent calls can
+ *  block writing response headers for the full duration of the agent
+ *  run (often 5–30 min), so the default 300s headersTimeout has to be
+ *  disabled. AbortController on the call site enforces our actual cap. */
+const longTaskDispatcher = new UndiciAgent({
+  headersTimeout: 0,
+  bodyTimeout: 0,
+})
+
+export interface PeerState {
+  peer: MeshPeer
+  client: A2AClient
+  healthy: boolean
+  lastCheck?: Date
+  agentCard?: AgentCard
+  agents: AgentSkill[]
+  /** Count of back-to-back failed health probes since the last successful one.
+   *  Used to suppress transient flaps: the `healthy` flag only flips to false
+   *  after N consecutive failures (see UNHEALTHY_AFTER). Reset to 0 on success. */
+  consecutiveFailures: number
+  /** Last probe error message — surfaced for debugging via /mesh. */
+  lastError?: string
+  /** True once the peer has answered at least one probe in this process.
+   *  Distinguishes "temporarily unreachable node we know hosts these
+   *  agents" from "peer configured but never seen" — only the former is
+   *  worth deferring messages for. */
+  everHealthy: boolean
+}
+
+/** Number of consecutive failed probes required before we mark a peer
+ *  unhealthy. A busy remote daemon whose event loop stalls for one probe
+ *  cycle (e.g. during a 200K-token tier-2 agent turn) used to flip to
+ *  "unreachable" and back on the next tick, which was visible in the
+ *  dashboard as a cycling peer. With hysteresis, a single slow probe is
+ *  tolerated; only sustained unreachability actually flips the flag. */
+const UNHEALTHY_AFTER = 3
+
+export class A2AMesh {
+  private peers: Map<string, PeerState> = new Map()
+  private healthTimer?: ReturnType<typeof setInterval>
+  private config: DaemonConfig
+  private log: (...args: unknown[]) => void
+  /** Listeners fired on peer state transitions (recovered / lost /
+   *  skills changed). The daemon bridges these into the EventBus for
+   *  live operator visibility; the router uses them to replay messages
+   *  it deferred while a peer was unreachable. */
+  private peerChangeCallbacks: Array<(event: {
+    peer: string; healthy: boolean; skills: string[]; delta: "recovered" | "lost" | "skills-changed"
+  }) => void> = []
+
+  /** Register a listener for peer state transitions. Every registered
+   *  listener is called — an earlier single-callback field meant the
+   *  daemon's EventBus bridge silently displaced any other subscriber,
+   *  which is why the router could not learn about peer recovery.
+   *  Used to reach the daemon/router without a circular dependency. */
+  onPeerChange(cb: (event: {
+    peer: string; healthy: boolean; skills: string[]; delta: "recovered" | "lost" | "skills-changed"
+  }) => void): void {
+    this.peerChangeCallbacks.push(cb)
+  }
+
+  /** Fan a transition out to every listener. One throwing listener must
+   *  not stop the others or abort the discovery loop. */
+  private emitPeerChange(event: {
+    peer: string; healthy: boolean; skills: string[]; delta: "recovered" | "lost" | "skills-changed"
+  }): void {
+    for (const cb of this.peerChangeCallbacks) {
+      try { cb(event) } catch (e: any) {
+        this.log(`peer-change listener failed for "${event.peer}": ${e?.message || e}`)
+      }
+    }
+  }
+
+  constructor(
+    config: DaemonConfig,
+    log: (...args: unknown[]) => void = console.error.bind(console, "[mesh]"),
+  ) {
+    this.config = config
+    this.log = log
+
+    for (const peer of config.mesh.peers) {
+      this.peers.set(peer.name, {
+        peer,
+        client: new A2AClient(peer.url, peer.token),
+        healthy: false,
+        agents: [],
+        consecutiveFailures: 0,
+        everHealthy: false,
+      })
+    }
+  }
+
+  /**
+   * Start the mesh: discover peers and begin health checks.
+   */
+  async start(): Promise<void> {
+    this.log(`Mesh starting with ${this.peers.size} peer(s)`)
+
+    // Initial discovery
+    await this.discoverAll()
+
+    // Periodic health checks
+    const interval = this.config.mesh.healthCheck.interval * 1000
+    this.healthTimer = setInterval(() => this.discoverAll(), interval)
+  }
+
+  async stop(): Promise<void> {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer)
+    }
+  }
+
+  /** Hot-reload the peer set from a fresh config. Adds new peers (kicks off
+   *  immediate discovery), removes vanished ones, and rebuilds the A2AClient
+   *  for peers whose url or token changed. Health-check interval is honored
+   *  on the next tick — we don't reset the timer just for peer-set edits.
+   *  Returns the diff for the caller to log. */
+  async reloadPeers(next: DaemonConfig): Promise<{ added: string[]; removed: string[]; updated: string[] }> {
+    this.config = next
+    const oldIds = new Set(this.peers.keys())
+    const newPeers = new Map(next.mesh.peers.map((p) => [p.name, p] as const))
+    const added: string[] = []
+    const removed: string[] = []
+    const updated: string[] = []
+
+    // Remove vanished peers.
+    for (const id of oldIds) {
+      if (!newPeers.has(id)) {
+        this.peers.delete(id)
+        removed.push(id)
+      }
+    }
+
+    // Add or update the rest.
+    const rediscover: Array<[string, PeerState]> = []
+    for (const [id, peer] of newPeers) {
+      const existing = this.peers.get(id)
+      if (!existing) {
+        const state: PeerState = {
+          peer,
+          client: new A2AClient(peer.url, peer.token),
+          healthy: false,
+          agents: [],
+          consecutiveFailures: 0,
+          everHealthy: false,
+        }
+        this.peers.set(id, state)
+        added.push(id)
+        rediscover.push([id, state])
+        continue
+      }
+      // URL or token changed — rebuild the client and redo discovery.
+      if (existing.peer.url !== peer.url || existing.peer.token !== peer.token) {
+        existing.peer = peer
+        existing.client = new A2AClient(peer.url, peer.token)
+        existing.healthy = false
+        existing.consecutiveFailures = 0  // fresh client; old counter is stale
+        updated.push(id)
+        rediscover.push([id, existing])
+      } else {
+        existing.peer = peer // pick up tag/other metadata edits
+      }
+    }
+
+    // Immediate discovery for changed/new peers — don't wait for the next
+    // interval tick since the whole point of /reload is instant feedback.
+    if (rediscover.length) {
+      await Promise.allSettled(rediscover.map(([id, state]) => this.discoverPeer(id, state)))
+    }
+
+    return { added, removed, updated }
+  }
+
+  /** Number of peers currently registered (regardless of health). */
+  peerCount(): number {
+    return this.peers.size
+  }
+
+  /**
+   * Re-probe a single peer immediately. Use case: an operator just added
+   * an agent on the remote daemon and doesn't want to wait up to a full
+   * health-check interval (default 60s) before mentioning the new agent
+   * resolves. The probe pulls a fresh agent card and updates `state.agents`
+   * so `directory()` reflects the new roster on the very next route lookup.
+   *
+   * Returns true on success, false when the peer is unknown or the probe
+   * failed. Does NOT throw — callers can blindly fan-out across peers.
+   */
+  async refreshPeer(name: string): Promise<boolean> {
+    const state = this.peers.get(name)
+    if (!state) return false
+    await this.discoverPeer(name, state)
+    return state.healthy
+  }
+
+  /**
+   * Re-probe every peer in parallel. Cheap when peers are healthy
+   * (single GET /a2a/agent-card per peer). Used by `agentx mesh refresh`
+   * and after agent-roster changes to invalidate the cached directory.
+   */
+  async refreshAll(): Promise<{ name: string; healthy: boolean }[]> {
+    const probes = Array.from(this.peers.entries()).map(async ([name, state]) => {
+      await this.discoverPeer(name, state)
+      return { name, healthy: state.healthy }
+    })
+    return Promise.all(probes)
+  }
+
+  /**
+   * Discover agent cards from all peers.
+   */
+  async discoverAll(): Promise<void> {
+    const results = await Promise.allSettled(
+      Array.from(this.peers.entries()).map(([name, state]) =>
+        this.discoverPeer(name, state),
+      ),
+    )
+
+    const healthy = Array.from(this.peers.values()).filter((p) => p.healthy).length
+    this.log(`Discovery complete: ${healthy}/${this.peers.size} peers healthy`)
+  }
+
+  private async discoverPeer(name: string, state: PeerState): Promise<void> {
+    const timeout = this.config.mesh.healthCheck.timeout * 1000
+
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), timeout)
+
+      const card = await state.client.getAgentCard()
+      clearTimeout(timer)
+
+      // Success — clear failure counter, flip healthy on if it was off.
+      const wasDown = !state.healthy
+      const prevSkills = new Set(state.agents.map((a) => a.id))
+      state.healthy = true
+      state.lastCheck = new Date()
+      state.agentCard = card
+      state.agents = card.skills || []
+      state.consecutiveFailures = 0
+      state.lastError = undefined
+      state.everHealthy = true
+      const nextSkills = new Set(state.agents.map((a) => a.id))
+      const skillsChanged = prevSkills.size !== nextSkills.size || [...nextSkills].some((s) => !prevSkills.has(s))
+
+      if (wasDown) {
+        this.log(`Peer "${name}" recovered: ${card.name} (${state.agents.length} skills)`)
+        this.emitPeerChange({ peer: name, healthy: true, skills: [...nextSkills], delta: "recovered" })
+      } else {
+        this.log(`Peer "${name}" healthy: ${card.name} (${state.agents.length} skills)`)
+        if (skillsChanged) {
+          this.emitPeerChange({ peer: name, healthy: true, skills: [...nextSkills], delta: "skills-changed" })
+        }
+      }
+    } catch (e: any) {
+      state.lastCheck = new Date()
+      state.lastError = e.message
+      state.consecutiveFailures++
+      // Hysteresis: require UNHEALTHY_AFTER consecutive failures before
+      // flipping the flag. Prevents transient event-loop stalls on the
+      // remote daemon from cycling the peer as seen from the dashboard.
+      if (state.consecutiveFailures >= UNHEALTHY_AFTER && state.healthy) {
+        state.healthy = false
+        this.log(`Peer "${name}" unreachable (${state.consecutiveFailures} consecutive failures): ${e.message}`)
+        this.emitPeerChange({ peer: name, healthy: false, skills: state.agents.map((a) => a.id), delta: "lost" })
+      } else if (state.consecutiveFailures < UNHEALTHY_AFTER) {
+        this.log(`Peer "${name}" probe failed (${state.consecutiveFailures}/${UNHEALTHY_AFTER}): ${e.message}`)
+      }
+    }
+  }
+
+  /**
+   * Send a task to a remote peer by name.
+   * Uses the peer's /task HTTP endpoint (agentx daemon API).
+   * If no agent specified, uses the first available agent on the peer.
+   */
+  async sendTask(
+    peerName: string,
+    text: string,
+    agentId?: string,
+    opts: {
+      timeoutMs?: number
+      /** Identity of the agent on whose behalf this call is made. Forwarded
+       *  in the request body so the receiving daemon can record it in
+       *  route_traces and (in a future protocol revision) validate that the
+       *  caller is allowed to act for this agent. Optional during the
+       *  log-warn rollout; missing values produce a server-side warning. */
+      senderAgentId?: string
+      /** Force a fresh session on the receiving daemon (clears cached
+       *  claudeSessionId + kills any persistent-process handle keyed
+       *  on the receiver's (agent, channel, chatId) before exec).
+       *  Defaults undefined → receiver applies its own auto-default
+       *  (true when senderAgentId is set, otherwise false). Set
+       *  explicitly to override. */
+      freshSession?: boolean
+      /** Origin context — channel, chatId, sender, channelMeta, etc. Forwarded
+       *  to the receiving daemon's /task handler verbatim so the receiver's
+       *  registry.execute() keys the session by the SAME (channel, chatId)
+       *  the sender used, instead of falling back to api/default. Without
+       *  this, a GitLab webhook routed across the mesh lands in the
+       *  recipient's api:default bucket with no project, no issue id, no
+       *  channelMeta — i.e., the globex/umbrella confusion incident on
+       *  2026-04-29 issue #709. Shape matches AgentTask.context. */
+      context?: Record<string, unknown>
+      /** The message being forwarded, so the receiver can post its answer
+       *  back through this node after a restart cut the forward off (#311). */
+      replyVia?: { messageId?: string; accountId?: string }
+    } = {},
+  ): Promise<string> {
+    const state = this.peers.get(peerName)
+    if (!state) throw new Error(`Unknown peer: ${peerName}`)
+    if (!state.healthy) throw new Error(`Peer "${peerName}" is not healthy`)
+
+    // Default to first agent on the peer
+    const agent = agentId || state.agents[0]?.id
+    if (!agent) throw new Error(`Peer "${peerName}" has no agents`)
+
+    const root = publishForward(peerName, agent)
+    const url = `${state.peer.url}/task`
+    const headers: Record<string, string> = { "Content-Type": "application/json" }
+    if (state.peer.token) {
+      headers["Authorization"] = `Bearer ${state.peer.token}`
+    }
+
+    // Agent tasks frequently run for minutes (Claude Code sessions in
+    // particular). Two timeout layers to defeat:
+    //
+    //   1. AbortController on our side — explicit request timeout. Default 30 min.
+    //   2. undici dispatcher's `headersTimeout` (300s default) — fires
+    //      independently of AbortController while the peer is still
+    //      synchronously processing the agent task before writing
+    //      response headers. This is what surfaces as the opaque
+    //      "fetch failed" exactly 5 minutes in. Per-call dispatcher
+    //      with disabled headersTimeout/bodyTimeout fixes it.
+    const timeoutMs = opts.timeoutMs ?? 30 * 60 * 1000
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    // Use undici's own fetch — the Node global `fetch` ignores the
+    // `dispatcher` option (its undici instance is internal and separate
+    // from this package's). Without our custom dispatcher, headersTimeout
+    // would still default to 300s and abort before the agent finishes.
+    let res: Awaited<ReturnType<typeof undiciFetch>>
+    try {
+      res = await undiciFetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          agent,
+          message: text,
+          // A2A protocol field — receiving daemon validates and records.
+          // Omitted from the body (rather than sent as undefined) so the
+          // server's "missing senderAgentId" log-warn fires only when the
+          // caller genuinely didn't pass one.
+          ...(opts.senderAgentId ? { senderAgentId: opts.senderAgentId } : {}),
+          // freshSession: forwarded only when the caller passed an explicit
+          // value. Omitted → receiver applies its own auto-default for A2A.
+          ...(typeof opts.freshSession === "boolean" ? { freshSession: opts.freshSession } : {}),
+          // Origin context (channel, chatId, channelMeta, sender, ...).
+          // Optional for back-compat — older callers continue to work, with
+          // the receiver defaulting channel/chatId as before.
+          ...(opts.context ? { context: opts.context } : {}),
+          ...(opts.replyVia ? { replyVia: { node: this.config.node.name, ...opts.replyVia } } : {}),
+          ...root,
+        }),
+        signal: controller.signal,
+        dispatcher: longTaskDispatcher,
+      })
+    } catch (e: any) {
+      clearTimeout(timer)
+      if (controller.signal.aborted) {
+        throw new Error(`Peer "${peerName}" /task timed out after ${Math.round(timeoutMs / 1000)}s`)
+      }
+      throw e
+    }
+    clearTimeout(timer)
+
+    // The daemon's /task handler returns 500 with `{ error: "<reason>" }`
+    // when registry.execute fails (Claude timeout, Anthropic overload, operator
+    // cancel, mid-turn process exit, ...). Read the body even on !res.ok so
+    // the caller sees the real reason instead of an opaque "/task error: 500".
+    if (!res.ok) {
+      let detail = ""
+      try {
+        const errBody = await res.json() as { error?: string }
+        if (errBody.error) detail = `: ${errBody.error}`
+      } catch {
+        /* body was not JSON — fall through with status only */
+      }
+      throw new Error(`Peer "${peerName}" /task error: ${res.status}${detail}`)
+    }
+
+    const data = await res.json() as { content?: string; error?: string }
+    if (data.error) throw new Error(`Peer "${peerName}" agent error: ${data.error}`)
+    return data.content || "No response"
+  }
+
+  /**
+   * Streaming variant of `sendTask`. POSTs to the peer's `/task` with
+   * `Accept: text/event-stream`, parses the agentx SSE wire (event/data
+   * pairs), and yields `{event, data}` records as they arrive — text
+   * deltas, thinking chunks, tool start/result, and a terminal
+   * `done` (or `error`).
+   *
+   * Same timeout + dispatcher story as sendTask: undici dispatcher with
+   * disabled headersTimeout/bodyTimeout so a multi-minute agent run does
+   * not get killed by the default 300s headers cap, while an
+   * AbortController enforces our own wall-clock.
+   */
+  async *sendTaskStream(
+    peerName: string,
+    text: string,
+    agentId?: string,
+    opts: {
+      timeoutMs?: number
+      senderAgentId?: string
+      freshSession?: boolean
+      context?: Record<string, unknown>
+      /** Aborts the peer call; the peer's /task treats it as a disconnect
+       *  and interrupts the run. */
+      signal?: AbortSignal
+    } = {},
+  ): AsyncGenerator<{ event: string; data: any }> {
+    const state = this.peers.get(peerName)
+    if (!state) throw new Error(`Unknown peer: ${peerName}`)
+    if (!state.healthy) throw new Error(`Peer "${peerName}" is not healthy`)
+
+    const agent = agentId || state.agents[0]?.id
+    if (!agent) throw new Error(`Peer "${peerName}" has no agents`)
+
+    const root = publishForward(peerName, agent)
+    const url = `${state.peer.url}/task`
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    }
+    if (state.peer.token) headers["Authorization"] = `Bearer ${state.peer.token}`
+
+    const timeoutMs = opts.timeoutMs ?? 30 * 60 * 1000
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const onCallerAbort = () => controller.abort()
+    if (opts.signal?.aborted) onCallerAbort()
+    opts.signal?.addEventListener("abort", onCallerAbort, { once: true })
+
+    let res: Awaited<ReturnType<typeof undiciFetch>>
+    try {
+      res = await undiciFetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          agent,
+          message: text,
+          stream: true,
+          ...(opts.senderAgentId ? { senderAgentId: opts.senderAgentId } : {}),
+          ...(typeof opts.freshSession === "boolean" ? { freshSession: opts.freshSession } : {}),
+          ...(opts.context ? { context: opts.context } : {}),
+          ...root,
+        }),
+        signal: controller.signal,
+        dispatcher: longTaskDispatcher,
+      })
+    } catch (e: any) {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener("abort", onCallerAbort)
+      if (opts.signal?.aborted) throw new Error(`Peer "${peerName}" /task stream cancelled by the caller`)
+      if (controller.signal.aborted) throw new Error(`Peer "${peerName}" /task stream timed out after ${Math.round(timeoutMs / 1000)}s`)
+      throw e
+    }
+
+    if (!res.ok) {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener("abort", onCallerAbort)
+      let detail = ""
+      try {
+        const errBody = await res.text()
+        detail = errBody ? `: ${errBody.slice(0, 200)}` : ""
+      } catch { /* */ }
+      throw new Error(`Peer "${peerName}" /task stream error: ${res.status}${detail}`)
+    }
+    if (!res.body) {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener("abort", onCallerAbort)
+      throw new Error(`Peer "${peerName}" /task stream has no body`)
+    }
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ""
+    let pendingEvent = "message"
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        // Split on SSE record boundaries (\n\n). The trailing partial
+        // record stays in `buffer` for the next iteration.
+        let sep = buffer.indexOf("\n\n")
+        while (sep !== -1) {
+          const record = buffer.slice(0, sep)
+          buffer = buffer.slice(sep + 2)
+          sep = buffer.indexOf("\n\n")
+          if (!record.trim()) continue
+          let event = "message"
+          const dataLines: string[] = []
+          for (const line of record.split("\n")) {
+            if (line.startsWith(":")) continue // comment / heartbeat
+            if (line.startsWith("event:")) event = line.slice(6).trim()
+            else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim())
+          }
+          if (dataLines.length === 0) continue
+          let data: any = dataLines.join("\n")
+          try { data = JSON.parse(data) } catch { /* leave as string */ }
+          yield { event, data }
+          pendingEvent = event
+          if (event === "done" || event === "error") return
+        }
+      }
+    } finally {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener("abort", onCallerAbort)
+      try { await reader.cancel() } catch { /* */ }
+    }
+    void pendingEvent
+  }
+
+  /**
+   * Forward a WebRTC signaling message (SDP / ICE / hangup) to a remote peer's
+   * /webrtc/signal endpoint. Not gated by peer health — a healthy control plane
+   * is useful but a one-off probe miss should not drop a live call; the browser
+   * layer will retry on timeout.
+   *
+   * Peer lookup is tolerant: the `to` field comes from whichever daemon
+   * originated the signal, which often spells the same node differently
+   * ("HQ-Local" vs "hq-local"). Match on a normalized name so config
+   * drift across sides doesn't break the signaling path.
+   */
+  async sendSignal(peerName: string, signal: unknown): Promise<boolean> {
+    const state = this.peers.get(peerName) || this.findPeerByNormalizedName(peerName)
+    if (!state) throw new Error(`Unknown peer: ${peerName}`)
+
+    const url = `${state.peer.url}/webrtc/signal`
+    const headers: Record<string, string> = { "Content-Type": "application/json" }
+    if (state.peer.token) {
+      headers["Authorization"] = `Bearer ${state.peer.token}`
+    }
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(signal),
+      })
+      return res.ok
+    } catch (e: any) {
+      this.log(`sendSignal to "${peerName}" failed: ${e.message}`)
+      return false
+    }
+  }
+
+  /** Look up a peer by a name that differs only in case / non-alphanumeric
+   *  characters (e.g. spaces, hyphens). Used by WebRTC signaling where the
+   *  `to` value is controlled by the opposite daemon and may not match the
+   *  exact spelling in this daemon's `mesh.peers[].name`. */
+  private findPeerByNormalizedName(name: string): PeerState | undefined {
+    const want = name.toLowerCase().replace(/[^a-z0-9]/g, "")
+    for (const [key, state] of this.peers) {
+      if (key.toLowerCase().replace(/[^a-z0-9]/g, "") === want) return state
+    }
+    return undefined
+  }
+
+  /**
+   * Find a peer that has a specific skill.
+   */
+  findPeerWithSkill(skillId: string): PeerState | undefined {
+    for (const state of this.peers.values()) {
+      if (state.healthy && state.agents.some((a) => a.id === skillId)) {
+        return state
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Get the combined agent directory across all healthy peers.
+   *
+   * `channels` lists the channel adapter names each peer hosts (telegram,
+   * whatsapp, gitlab, ...) — sourced from the peer's agent-card. Used by
+   * workflow `action.send` to forward outbound messages back to the peer
+   * that owns the channel when the workflow runs on a different node.
+   */
+  /**
+   * Auth headers for daemon-level fetches to a peer's protected endpoints.
+   * Tokens deliberately never ride along in directory() — it is served to
+   * dashboards and /mesh; look them up per-request by peer name instead.
+   */
+  authHeaders(peerName: string): Record<string, string> {
+    const token = this.peers.get(peerName)?.peer.token
+    return token ? { Authorization: `Bearer ${token}` } : {}
+  }
+
+  /**
+   * Find the peer that hosts `agentId`, including peers that are currently
+   * unreachable but were healthy earlier in this process (their last-known
+   * skill list is retained across a failed probe).
+   *
+   * Routing uses this to tell a genuinely unknown agent apart from one whose
+   * node is simply down: the first is a drop, the second is a deferral.
+   */
+  findAgentPeer(agentId: string): { peer: string; healthy: boolean } | undefined {
+    for (const [name, state] of this.peers) {
+      if (!state.healthy && !state.everHealthy) continue
+      if (state.agents.some((a) => a.id === agentId)) {
+        return { peer: name, healthy: state.healthy }
+      }
+    }
+    return undefined
+  }
+
+  directory(): Array<{
+    peer: string
+    peerUrl: string
+    healthy: boolean
+    skills: AgentSkill[]
+    channels: string[]
+    /** The node's own name, from its agent card. */
+    node?: string
+    lastCheck?: Date
+  }> {
+    return Array.from(this.peers.entries()).map(([name, state]) => ({
+      peer: name,
+      peerUrl: state.peer.url,
+      healthy: state.healthy,
+      skills: state.agents,
+      channels: Array.isArray((state.agentCard as any)?.channels)
+        ? ((state.agentCard as any).channels as unknown[]).map((c) => String(c))
+        : [],
+      node: typeof state.agentCard?.name === "string" ? state.agentCard.name : undefined,
+      lastCheck: state.lastCheck,
+    }))
+  }
+}
+
+/** Record a mesh forward on the bus and return the fields that carry its
+ *  root to the peer's /task: the peer's events share `rootId`, and name
+ *  this forward as their parent. */
+function publishForward(peer: string, agent: string): { rootId: string; parentEventId: string } {
+  const e = getEventBus().publish({ kind: "mesh", type: "forward", agentId: agent, summary: `forwarded to ${agent} on ${peer}` })
+  return { rootId: e.rootId, parentEventId: e.id }
+}
+
+/** Root context for an inbound /task: the sender's root when a mesh peer
+ *  supplied one, otherwise a new entry point. */
+export function rootFromTaskBody(body: Record<string, unknown>): RootContext {
+  const rootId = typeof body.rootId === "string" && body.rootId.length <= 100 ? body.rootId : undefined
+  if (!rootId) return { rootId: newEventId() }
+  const parentId = typeof body.parentEventId === "string" && body.parentEventId.length <= 100 ? body.parentEventId : undefined
+  return parentId ? { rootId, parentId } : { rootId }
+}

@@ -1,0 +1,19 @@
+[Unit]
+Description=AgentX multi-agent daemon (Dhodi team)
+After=network-online.target 9router.service muse-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/USER
+Environment=NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+EnvironmentFile=/home/USER/workspace/agentx/.env
+WorkingDirectory=/home/USER/workspace/agentx
+ExecStart=/usr/bin/node /home/USER/workspace/agentx/dist/cli.js daemon start
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,377 @@
+// --- agentx demo: the zero-key mesh walkthrough ---
+//
+// Boots three real daemons on loopback ports, pairs them into a real
+// A2A mesh (bearer-token verified), and plays a scripted scenario
+// through the genuine plumbing: /task dispatch on node A, a mesh hop
+// to node B via /send/agent, and a wrap-up turn — every step visible
+// in the /live dashboards and recorded in each node's intent ledger.
+//
+// Honesty contract: the ONLY fake thing is the model (a scripted
+// provider, src/agent/providers/demo.ts). Daemons, HTTP, mesh
+// discovery, auth, ledger rows: all real. The banner says so.
+
+import { Command } from "commander"
+import chalk from "chalk"
+import { spawn, type ChildProcess } from "child_process"
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync, openSync, existsSync } from "fs"
+import { resolve, join } from "path"
+import { randomBytes } from "crypto"
+import { demoReportWorkflow } from "./demo-workflow"
+import { configStartupTimeout, resolveStartupTimeout } from "./demo-startup"
+
+interface NodeSpec {
+  dir: string
+  id: string
+  name: string
+  port: number
+  agentId: string
+  agentName: string
+  persona: string
+  script: object
+}
+
+const KICKOFF = "[demo] Customer reports checkout is broken and CI is red on demo/shop. Handle it."
+const DELEGATION = "CI is red on demo/shop — checkout.test.ts failing on Node 22. Diagnose, fix, and report back."
+
+function buildSpecs(root: string, basePort: number): NodeSpec[] {
+  return [
+    {
+      dir: join(root, "node-a"),
+      id: "demo-laptop",
+      name: "laptop-paris",
+      port: basePort,
+      agentId: "cx",
+      agentName: "CX",
+      persona: "You are CX, the customer-facing coordinator. You triage inbound issues and delegate technical work to @builder on the vps node.",
+      script: {
+        steps: [
+          {
+            match: "USER: Build the demo report workflow",
+            reply: "Here is a scripted example: start it manually, ask CX for a report, then finish. It is saved disabled so you can review it before running.\n\n```json\n" + JSON.stringify(demoReportWorkflow, null, 2) + "\n```",
+            delayMs: 300,
+            chunkMs: 2,
+          },
+          {
+            match: "Prepare the demo shop report",
+            reply: "Demo shop report: checkout checks passed, MR !47 is ready for review, and CX has drafted the customer update. This is a scripted example.",
+            delayMs: 500,
+          },
+          {
+            match: "checkout is broken",
+            thinking: "Checkout failure + red CI — this is a build problem, not a support question. @builder on vps-nyc owns demo/shop.",
+            reply:
+              "Checkout failure traced to the red pipeline on demo/shop. This needs a code fix — delegating to @builder on the vps-nyc node over the mesh. I'll report back on this thread.",
+            delayMs: 900,
+          },
+          {
+            match: "Builder reports",
+            thinking: "Fix confirmed and pipeline green — close the loop with the customer.",
+            reply:
+              "Resolved ✅ — builder patched checkout.test.ts (Node 22 crypto import), MR !47 merged, pipeline green. Customer thread updated. Every hop of this run is in the ledger: `agentx ledger`.",
+            delayMs: 800,
+          },
+        ],
+        fallback: {
+          reply: "Demo mode — I answer from a script. Try the scripted scenario, or run `agentx setup` to connect a real model.",
+        },
+      },
+    },
+    {
+      dir: join(root, "node-b"),
+      id: "demo-vps",
+      name: "vps-nyc",
+      port: basePort + 1,
+      agentId: "builder",
+      agentName: "Builder",
+      persona: "You are Builder, the engineering agent on the vps node. You fix code, open MRs, and report results tersely.",
+      script: {
+        steps: [
+          {
+            match: "checkout\\.test\\.ts|CI is red",
+            thinking: "Reproducing on Node 22… crypto.webcrypto import moved. Patching the test setup, rerunning the suite.",
+            reply:
+              "Fixed. checkout.test.ts assumed the legacy crypto.webcrypto import — patched for Node 22, suite green locally. Opened MR !47 on demo/shop; pipeline is green. Handing back to @cx.",
+            delayMs: 1400,
+            chunkMs: 40,
+          },
+        ],
+        fallback: { reply: "Builder here (demo script). Send me a failing pipeline." },
+      },
+    },
+    {
+      dir: join(root, "node-c"),
+      id: "demo-pi",
+      name: "pi-office",
+      port: basePort + 2,
+      agentId: "scout",
+      agentName: "Scout",
+      persona: "You are Scout, the monitoring agent on the office Raspberry Pi. You watch schedules and report status.",
+      script: {
+        fallback: { reply: "Scout here (demo script) — all monitors green on pi-office." },
+        steps: [],
+      },
+    },
+  ]
+}
+
+function writeNode(spec: NodeSpec, all: NodeSpec[], meshToken: string): void {
+  const ws = join(spec.dir, "workspaces", spec.agentId)
+  mkdirSync(ws, { recursive: true })
+  writeFileSync(join(ws, "CLAUDE.md"), `# ${spec.agentName}\n\n${spec.persona}\n`)
+  writeFileSync(join(spec.dir, "demo-script.json"), JSON.stringify(spec.script, null, 2))
+
+  const peers = all
+    .filter((n) => n.id !== spec.id)
+    .map((n) => ({ name: n.name, url: `http://127.0.0.1:${n.port}`, token: meshToken }))
+
+  const config = {
+    node: { id: spec.id, name: spec.name, bind: `127.0.0.1:${spec.port}`, defaultAgent: spec.agentId },
+    // The dashboard block is read by the `agentx board serve` child the
+    // demo starts for node A — it discovers the other nodes through the
+    // daemon's /mesh directory, so one dashboard shows the whole mesh.
+    dashboard: { enabled: true, port: spec.port + 10, bind: "127.0.0.1", daemonUrl: `http://127.0.0.1:${spec.port}` },
+    providers: { demo: { apiKey: "demo-mode" } },
+    agents: {
+      [spec.agentId]: {
+        name: spec.agentName,
+        description: spec.persona,
+        workspace: "./workspaces/" + spec.agentId,
+        tier: "orchestrator",
+        provider: "demo",
+        mentions: [`@${spec.agentId}`, spec.agentId],
+        maxConcurrent: 2,
+        systemPrompt: spec.persona,
+      },
+    },
+    mesh: { enabled: true, peers, discovery: "static", healthCheck: { interval: 3, timeout: 5 } },
+    workflows: { enabled: true },
+  }
+  writeFileSync(join(spec.dir, "agentx.json"), JSON.stringify(config, null, 2))
+}
+
+async function waitFor(desc: string, fn: () => Promise<boolean>, timeoutMs: number): Promise<void> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    try { if (await fn()) return } catch { /* not ready */ }
+    await new Promise((r) => setTimeout(r, 250))
+  }
+  throw new Error(`Timed out waiting for ${desc} (${timeoutMs / 1000}s) — raise it with --startup-timeout <seconds>`)
+}
+
+/** One probe; a daemon that accepts but never answers must not outlast the limit. */
+function probe(url: string): Promise<Response> {
+  return fetch(url, { signal: AbortSignal.timeout(5000) })
+}
+
+async function post(port: number, path: string, body: object): Promise<any> {
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+  const data: any = await res.json().catch(() => ({}))
+  if (!res.ok || data.error) throw new Error(data.error || `${path} HTTP ${res.status}`)
+  return data
+}
+
+function say(role: string, text: string, color: (s: string) => string): void {
+  console.log()
+  console.log(color(`  ${role}`))
+  console.log(`  ${text.split("\n").join("\n  ")}`)
+}
+
+export const demo = new Command()
+  .name("demo")
+  .description("zero-key demo: three daemons, a real A2A mesh, a scripted scenario")
+  .option("--base-port <port>", "first of three consecutive loopback ports", "18921")
+  .option("--once", "play the scenario once and exit (default: keep daemons up until Ctrl-C)")
+  .option("--keep", "keep the .agentx-demo directory on exit")
+  .option("--no-open", "don't open the dashboard in a browser")
+  .option("--reuse", "resume an existing .agentx-demo instead of starting fresh (implies --keep)")
+  .option("--bind <host>", "dashboard bind address", "127.0.0.1")
+  .option("--startup-timeout <seconds>", "seconds each startup step may take (default: 60, longer when the machine is loaded)")
+  .action(async (opts) => {
+    const basePort = parseInt(opts.basePort, 10)
+    const root = resolve(process.cwd(), ".agentx-demo")
+    let startup: { seconds: number; source: string }
+    try {
+      startup = resolveStartupTimeout({
+        flag: opts.startupTimeout,
+        env: process.env.AGENTX_DEMO_STARTUP_TIMEOUT,
+        config: configStartupTimeout(process.cwd()),
+      })
+    } catch (e: any) {
+      console.error(chalk.red(e.message))
+      process.exit(1)
+    }
+    const startupMs = startup.seconds * 1000
+    const specs = buildSpecs(root, basePort)
+    const tokenFile = join(root, "mesh-token")
+    // A resumed demo keeps its history, so a container restart or a lesson
+    // re-run lands on the same screen. Peers carry the token in config, so
+    // it has to survive with them.
+    const reuse = Boolean(opts.reuse) && existsSync(tokenFile) && existsSync(join(specs[0].dir, "agentx.json"))
+    const meshToken = reuse ? readFileSync(tokenFile, "utf8").trim() : randomBytes(24).toString("hex")
+    const keep = opts.keep || opts.reuse
+    const children: ChildProcess[] = []
+
+    const cli = process.argv[1]
+    if (!cli || !existsSync(cli)) {
+      console.error(chalk.red("Cannot resolve the agentx CLI entrypoint — run via the installed `agentx` binary."))
+      process.exit(1)
+    }
+
+    if (!reuse) {
+      // Empty rather than remove: in the demo container the directory is a
+      // volume mount point, which cannot be deleted.
+      if (existsSync(root)) for (const f of readdirSync(root)) rmSync(join(root, f), { recursive: true, force: true })
+      for (const spec of specs) writeNode(spec, specs, meshToken)
+      writeFileSync(tokenFile, meshToken + "\n", { mode: 0o600 })
+    }
+
+    console.log()
+    console.log(chalk.bold("  agentx demo — one message, three machines (simulated on loopback)"))
+    console.log(chalk.yellow("  Canned model responses. Real daemons, real A2A mesh, real ledger."))
+    console.log(chalk.dim("  Run `agentx setup` to wire real agents.\n"))
+    console.log(chalk.dim(`  Startup limit: ${startup.seconds}s per step (${startup.source})`))
+
+    let tearingDown = false
+    const teardown = (code: number) => {
+      if (tearingDown) return
+      tearingDown = true
+      for (const c of children) { try { c.kill("SIGTERM") } catch { /* gone */ } }
+      setTimeout(() => {
+        if (!keep) { try { rmSync(root, { recursive: true, force: true }) } catch { /* busy */ } }
+        process.exit(code)
+      }, 800)
+    }
+    process.on("SIGINT", () => teardown(0))
+    process.on("SIGTERM", () => teardown(0))
+
+    // Environment for the child daemons: demo script + shared mesh token.
+    // Strip inherited model credentials so nothing real can be billed —
+    // the demo must be able to say "zero keys touched" truthfully.
+    const baseEnv = { ...process.env }
+    delete baseEnv.ANTHROPIC_API_KEY
+    delete baseEnv.ANTHROPIC_API_KEY_OLD
+    delete baseEnv.OPENAI_API_KEY
+    delete baseEnv.DEEPSEEK_API_KEY
+    // The ledger is off by default. The demo promises ledger rows for every
+    // hop, and the Activity map is drawn from them, so record in shadow mode.
+    baseEnv.INTENT_LEDGER_MODE ||= "shadow"
+
+    try {
+      for (const spec of specs) {
+        const logFd = openSync(join(spec.dir, "daemon.log"), "a")
+        const child = spawn(process.execPath, [cli, "daemon", "start", "-c", join(spec.dir, "agentx.json")], {
+          cwd: spec.dir,
+          env: { ...baseEnv, MESH_TOKEN: meshToken, AGENTX_DEMO_SCRIPT: join(spec.dir, "demo-script.json") },
+          stdio: ["ignore", logFd, logFd],
+        })
+        children.push(child)
+        console.log(chalk.dim(`  ▸ ${spec.name} starting on 127.0.0.1:${spec.port} (log: ${join(spec.dir, "daemon.log")})`))
+      }
+
+      const waitHealthy = (spec: NodeSpec) => waitFor(`${spec.name} /health`, async () => {
+        const r = await probe(`http://127.0.0.1:${spec.port}/health`)
+        return r.ok
+      }, startupMs)
+
+      // One dashboard process, attached to laptop-paris — it discovers the
+      // other two nodes over the mesh, so /live shows the whole fleet. It
+      // boots while the other two daemons still are; laptop-paris must be
+      // up first, as the dashboard shares its database.
+      await waitHealthy(specs[0])
+      const dashPort = specs[0].port + 10
+      {
+        const logFd = openSync(join(specs[0].dir, "board.log"), "a")
+        const child = spawn(process.execPath, [cli, "board", "serve", "--bind", opts.bind], {
+          cwd: specs[0].dir,
+          env: { ...baseEnv, MESH_TOKEN: meshToken },
+          stdio: ["ignore", logFd, logFd],
+        })
+        children.push(child)
+      }
+      for (const spec of specs.slice(1)) await waitHealthy(spec)
+      console.log(chalk.green("  ✓ three daemons up"))
+
+      await waitFor("dashboard /live", async () => {
+        const r = await probe(`http://127.0.0.1:${dashPort}/live`)
+        return r.ok
+      }, startupMs)
+      console.log(chalk.green("  ✓ dashboard up"))
+
+      await waitFor("mesh discovery (laptop sees both peers)", async () => {
+        const r = await probe(`http://127.0.0.1:${specs[0].port}/health`)
+        const h: any = await r.json()
+        const healthy = (h.mesh || []).filter((p: any) => p.healthy && p.skills?.length)
+        return healthy.length >= 2
+      }, startupMs)
+      // Note: on loopback the daemon's mesh-auth gate exempts callers by
+      // design, so don't claim token *verification* here — tokens are sent
+      // and the gate is exercised only on non-loopback deployments.
+      console.log(chalk.green("  ✓ A2A mesh healthy — agent cards exchanged across three nodes"))
+
+      const liveUrl = `http://127.0.0.1:${dashPort}/live`
+      console.log()
+      console.log(`  Dashboard:   ${chalk.cyan(liveUrl)}  (all three nodes via the mesh)`)
+      console.log(chalk.dim(`  Daemon APIs: ${specs.map((s) => `127.0.0.1:${s.port}`).join(" · ")}`))
+
+      if (opts.open !== false) {
+        const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open"
+        try { spawn(opener, [liveUrl], { stdio: "ignore", detached: true }).unref() } catch { /* headless */ }
+      }
+
+      const playScenario = async () => {
+        console.log()
+        console.log(chalk.bold("  ── Scenario: red pipeline, cross-node fix ──"))
+        say("You → @cx (laptop-paris)", KICKOFF, chalk.cyan)
+
+        const s1 = await post(specs[0].port, "/task", { agent: "cx", message: KICKOFF })
+        say("@cx (laptop-paris)", s1.content || "(no content)", chalk.green)
+
+        console.log()
+        console.log(chalk.magenta("  ⇄ mesh hop: laptop-paris → vps-nyc (A2A /task)"))
+        const s2 = await post(specs[0].port, "/send/agent", {
+          agentId: "builder",
+          senderAgentId: "cx",
+          text: DELEGATION,
+        })
+        const builderReply = typeof s2.messageId === "string" ? s2.messageId : s2.content || "(no reply)"
+        say("@builder (vps-nyc)", builderReply, chalk.yellow)
+
+        const s3 = await post(specs[0].port, "/task", {
+          agent: "cx",
+          message: `[demo] Builder reports: ${builderReply}`,
+        })
+        say("@cx (laptop-paris)", s3.content || "(no content)", chalk.green)
+
+        console.log()
+        console.log(chalk.dim(`  Inspect the run: ${liveUrl}  ·  ledger rows on each node record every dispatch`))
+        console.log(chalk.dim(`  Worth your time? A star helps others find it: ${chalk.cyan("https://github.com/anis-marrouchi/agentx")}`))
+      }
+
+      // A resumed demo already recorded the scenario; replaying it on every
+      // restart would stack duplicate runs into the history lessons show.
+      if (reuse) console.log(chalk.dim("  Resumed existing demo state — press Enter to replay the scenario."))
+      else await playScenario()
+
+      if (opts.once) {
+        console.log()
+        console.log(chalk.dim("  --once: shutting down."))
+        teardown(0)
+        return
+      }
+
+      console.log()
+      console.log(chalk.bold("  Daemons stay up — browse the dashboards. Press Enter to replay, Ctrl-C to exit."))
+      process.stdin.setEncoding("utf8")
+      process.stdin.on("data", () => { playScenario().catch((e) => console.error(chalk.red(`  Replay failed: ${e.message}`))) })
+      process.stdin.resume()
+    } catch (e: any) {
+      console.error()
+      console.error(chalk.red(`  Demo failed: ${e.message}`))
+      console.error(chalk.dim(`  Node logs: ${specs.map((s) => join(s.dir, "daemon.log")).join(", ")}`))
+      teardown(1)
+    }
+  })

@@ -1,0 +1,103 @@
+import type { EntityHint, FactRecord, FactSource } from "../types"
+
+// Emails, handles and profile URLs, from the GitLab instance.
+//
+// Where most of a fleet's entries arrive through GitLab, this is the
+// system that knows who the people in them are. The user search returns
+// `organization` and `job_title` too, but both are optional and often
+// blank — the source reports what it has and stays quiet about the
+// rest, so a blank job title never reaches the prompt as a fact.
+//
+// Host and token come from the environment. There is no default host:
+// guessing one would send entity names from a private corpus to
+// whatever answers at that address.
+
+export interface GitlabSourceOptions {
+  baseUrl?: string
+  token?: string
+}
+
+interface GitlabUser {
+  username?: string
+  name?: string
+  email?: string
+  public_email?: string
+  organization?: string
+  job_title?: string
+  web_url?: string
+  state?: string
+}
+
+export function createGitlabSource(opts: GitlabSourceOptions = {}): FactSource {
+  const baseUrl = (opts.baseUrl ?? process.env.GITLAB_URL ?? "").replace(/\/+$/, "")
+  const token = opts.token ?? process.env.GITLAB_ADMIN_TOKEN ?? process.env.GITLAB_TOKEN
+
+  return {
+    name: "gitlab",
+    provides: ["email", "handle", "profile URL"],
+    async available() {
+      if (!baseUrl) {
+        return { kind: "not-configured", hint: "export GITLAB_URL=https://<your-gitlab-host>" }
+      }
+      if (!token) {
+        return { kind: "not-configured", hint: "export GITLAB_ADMIN_TOKEN=<PAT>  (read_api scope is enough)" }
+      }
+      // A present-but-rejected token is the dangerous case: every lookup
+      // returns nothing, which is indistinguishable from "this person is
+      // not in GitLab", and the corpus quietly grows a hole while the
+      // source reports itself healthy. One authenticated call turns that
+      // into a prompt.
+      try {
+        const res = await fetch(`${baseUrl}/api/v4/user`, { headers: { "PRIVATE-TOKEN": token } })
+        if (res.status === 401 || res.status === 403) {
+          return { kind: "not-configured", hint: `GitLab rejected the token (${res.status}) — set a valid GITLAB_ADMIN_TOKEN` }
+        }
+        if (!res.ok) {
+          return { kind: "failed", hint: `GitLab returned ${res.status} for the auth probe` }
+        }
+      } catch (err) {
+        return { kind: "failed", hint: `cannot reach ${baseUrl}: ${String((err as Error)?.message ?? err)}` }
+      }
+      return null
+    },
+    async lookup(hints: EntityHint[], signal?: AbortSignal) {
+      if (!token || !baseUrl) return []
+      const records: FactRecord[] = []
+      const seen = new Set<string>()
+      for (const h of hints) {
+        const url = `${baseUrl}/api/v4/users?search=${encodeURIComponent(h.name)}&per_page=5`
+        let users: GitlabUser[]
+        try {
+          const res = await fetch(url, { headers: { "PRIVATE-TOKEN": token }, signal })
+          if (!res.ok) continue
+          users = (await res.json()) as GitlabUser[]
+        } catch {
+          continue
+        }
+        if (!Array.isArray(users)) continue
+        for (const u of users) {
+          const key = u.username ?? u.web_url ?? ""
+          if (!key || seen.has(key)) continue
+          seen.add(key)
+          const fields: Record<string, string> = {}
+          const email = u.email || u.public_email
+          if (email) fields.email = email
+          if (u.username) fields.gitlab = `@${u.username}`
+          if (u.web_url) fields.profile = u.web_url
+          // Blank strings are the instance's default, not a stated fact.
+          if (u.organization) fields.organisation = u.organization
+          if (u.job_title) fields.role = u.job_title
+          if (u.state && u.state !== "active") fields.accountState = u.state
+          if (Object.keys(fields).length === 0) continue
+          records.push({
+            name: u.name ?? h.name,
+            source: "gitlab",
+            fields,
+            fuzzy: (u.name ?? "").toLowerCase() !== h.name.toLowerCase(),
+          })
+        }
+      }
+      return records
+    },
+  }
+}

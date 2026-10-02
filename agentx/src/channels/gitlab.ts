@@ -1,0 +1,2284 @@
+import type { ChannelAdapter, IncomingMessage, OutgoingMessage, ChannelMeta, SeededMessage } from "./types"
+import { createServer, type IncomingMessage as HttpRequest, type ServerResponse } from "http"
+import { debug } from "@/observability/debug"
+import type { HookRegistry } from "@/hooks"
+import { markBody, detectAgentxMarker, stripAgentxMarkers, forgeBody, forgeSender, forgeAuthorLabel, mappedForgeUsernames } from "./outbound-marker"
+import { getLedgerMode } from "@/intent/mode"
+import { getDefaultLedger } from "@/intent/instance"
+import { recordGitLabTargetDispatch, recordGitLabNoteDispatch, recordGitLabIssueLevelDecision } from "@/intent/sources/gitlab"
+
+// --- GitLab webhook channel adapter ---
+//
+// Receives GitLab webhook events (note/comment, issue, MR, push, pipeline)
+// and routes @mention comments to agents. Agents reply as GitLab API comments.
+//
+// Config:
+//   channels.gitlab:
+//     enabled: true
+//     webhookPort: 18810          # separate port for GitLab webhooks
+//     webhookSecret: "secret"     # validates X-Gitlab-Token header
+//     host: "https://gitlab.example.com"
+//     token: "${GITLAB_TOKEN}"    # for posting comments back
+//     routes:
+//       - project: "org/my-project"
+//         agent: "pm-agent"
+//       - project: "*"
+//         agent: "default-agent"   # default for unmatched projects
+
+export interface GitLabRoute {
+  project: string  // "group/project" or "*" for default
+  agent: string
+}
+
+export interface GitLabAgentMapping {
+  agentId: string
+  gitlabUsernames: string[]  // GitLab @usernames that map to this agent
+  keywords: string[]         // keywords in comments that trigger this agent (e.g. "coder", "devops")
+  token?: string             // per-agent GitLab PAT — posts comments as this agent's user
+  node?: string              // if set, forward to this mesh peer instead of handling locally
+}
+
+export interface GitLabChannelConfig {
+  webhookPort: number
+  webhookSecret?: string
+  host: string
+  token: string
+  routes: GitLabRoute[]
+  agentMappings?: GitLabAgentMapping[]  // @mention -> agent mappings
+  /** All known agent ids in this daemon — passed from the outer config by
+   *  the daemon at construction time. Used to auto-derive default GitLab
+   *  username mappings so operators don't have to hand-register every agent
+   *  for @mentions to work. Explicit entries in `agentMappings` always take
+   *  precedence (they carry per-agent tokens, non-standard usernames, etc.)
+   *  The auto-derived defaults are `@<agentId>` plus `@<prefix><agentId>`
+   *  for each of `agentUsernamePrefixes`.
+   *
+   *  Removal: when an agent is deleted from agents.<id>, its default mapping
+   *  disappears on next daemon restart. */
+  knownAgentIds?: string[]
+  /** Prefixes for extra derived usernames (e.g. "team-" → @team-<agentId>).
+   *  An organisation's naming convention, so it lives in config, not code. */
+  agentUsernamePrefixes?: string[]
+}
+
+interface GitLabNoteEvent {
+  object_kind: "note"
+  event_type: string
+  user: { name: string; username: string }
+  project: { path_with_namespace: string; web_url: string }
+  object_attributes: {
+    id: number
+    note: string
+    noteable_type: string  // "Issue", "MergeRequest", "Commit"
+    url: string
+  }
+  issue?: { iid: number; title: string; state: string }
+  merge_request?: { iid: number; title: string; state: string; source_branch: string; target_branch: string }
+}
+
+interface GitLabIssueEvent {
+  object_kind: "issue"
+  user: { id?: number; name: string; username: string }
+  project: { path_with_namespace: string }
+  object_attributes: {
+    iid: number
+    author_id?: number
+    title: string
+    description: string
+    state: string
+    action: string
+    url: string
+    assignee_ids?: number[]
+  }
+  /** Top-level current assignees (GitLab webhook payload). Each carries
+   *  username + name + id. Present on create, update, and reopen. Optional
+   *  in the type because some older payloads only carry assignee_ids. */
+  assignees?: Array<{ id: number; name?: string; username: string }>
+  /** Diff payload — present on `update` actions. We use changes.assignees
+   *  to detect assignment-add events (a username appears in current but
+   *  not previous). */
+  changes?: {
+    assignees?: { previous?: Array<{ id: number; username: string }>; current?: Array<{ id: number; username: string }> }
+  }
+}
+
+interface GitLabMREvent {
+  object_kind: "merge_request"
+  user: { id?: number; name: string; username: string }
+  project: { path_with_namespace: string }
+  object_attributes: {
+    iid: number
+    author_id?: number
+    title: string
+    description: string
+    state: string
+    action: string
+    source_branch: string
+    target_branch: string
+    url: string
+    assignee_ids?: number[]
+    reviewer_ids?: number[]
+  }
+  assignees?: Array<{ id: number; name?: string; username: string }>
+  reviewers?: Array<{ id: number; name?: string; username: string }>
+  changes?: {
+    assignees?: { previous?: Array<{ id: number; username: string }>; current?: Array<{ id: number; username: string }> }
+    reviewers?: { previous?: Array<{ id: number; username: string }>; current?: Array<{ id: number; username: string }> }
+  }
+}
+
+interface GitLabPipelineEvent {
+  object_kind: "pipeline"
+  user: { name: string; username: string }
+  project: { path_with_namespace: string }
+  object_attributes: {
+    id: number
+    ref: string
+    status: string
+    duration: number
+  }
+}
+
+type GitLabEvent = GitLabNoteEvent | GitLabIssueEvent | GitLabMREvent | GitLabPipelineEvent | Record<string, unknown>
+
+export class GitLabAdapter implements ChannelAdapter {
+  readonly name = "gitlab"
+  private config: GitLabChannelConfig
+  private handler?: (msg: IncomingMessage) => Promise<void>
+  private server?: ReturnType<typeof createServer>
+  private botUsername?: string  // resolved on first API call
+  private botUsernames: Set<string> = new Set()  // all known bot users (to prevent cascading)
+  /** Users AgentX posts notes as, resolved from its own tokens. Only their
+   *  notes may carry an agent's signature (#282). Configured
+   *  gitlabUsernames are read live from the config, see postsAs. Unlike
+   *  botUsernames, names merely derived from agent ids do not count. */
+  private postingUsernames: Set<string> = new Set()
+  private sentNoteIds: Set<string> = new Set()  // track our own comments
+  /** Maps actual GitLab username -> agentId (resolved from tokens at startup) */
+  private usernameToAgent: Map<string, string> = new Map()
+  /** Maps agentId -> actual GitLab username (resolved from tokens at startup) */
+  private agentToUsername: Map<string, string> = new Map()
+  /** Per-event dedup window for handleIssue/handleMR. Key:
+   *  `{project}:{kind}:{iid}:{agentId}:{action}:{trigger}`. Value:
+   *  expiresAtMs. Pruned lazily on each access. 5-min TTL covers GitLab's
+   *  webhook-retry window without keeping stale entries forever. */
+  private dispatchedTargets: Map<string, number> = new Map()
+  private readonly DISPATCH_TTL_MS = 5 * 60 * 1000
+  private log: (...args: unknown[]) => void
+  private hooks?: HookRegistry
+  /** Per-project rules — when set, gates webhook dispatch by action/labels/
+   *  state/author and resolves a runbook path for the agent. Optional;
+   *  unset = legacy behaviour (no filtering, no runbook injection). */
+  private rules?: import("@/projects/rules").ProjectRulesStore
+  private reactForwarder?: (node: string, project: string, noteableType: string, noteableIid: string, noteId: number, agentId: string, name: string) => Promise<void>
+  private sendNoteForwarder?: (node: string, project: string, noteableType: string, noteableIid: string, agentId: string, text: string) => Promise<string>
+  private logTimeForwarder?: (node: string, project: string, noteableType: string, noteableIid: string, agentId: string, durationMs: number) => Promise<void>
+  private createIssueForwarder?: (node: string, project: string, title: string, description: string, labels: string[], assignees: string[], agentId: string) => Promise<{ iid: number; url: string } | null>
+  private setLabelsForwarder?: (node: string, project: string, kind: "issue" | "merge_request", iid: string, add: string[], remove: string[], agentId: string) => Promise<string[] | null>
+  /** Optional mesh reference — when set, mention resolution falls back to
+   *  remote peers' agent-card skills/tags so @-mentions for agents that live
+   *  on another node route automatically without an explicit `agentMappings`
+   *  entry on this node. */
+  private mesh?: import("@/a2a/mesh").A2AMesh
+
+  constructor(config: GitLabChannelConfig, log: (...args: unknown[]) => void = console.error.bind(console, "[gitlab]"), hooks?: HookRegistry) {
+    this.config = config
+    this.log = log
+    this.hooks = hooks
+  }
+
+  setMesh(mesh: import("@/a2a/mesh").A2AMesh): void {
+    this.mesh = mesh
+  }
+
+  setReactForwarder(fn: (node: string, project: string, noteableType: string, noteableIid: string, noteId: number, agentId: string, name: string) => Promise<void>): void {
+    this.reactForwarder = fn
+  }
+
+  setSendNoteForwarder(fn: (node: string, project: string, noteableType: string, noteableIid: string, agentId: string, text: string) => Promise<string>): void {
+    this.sendNoteForwarder = fn
+  }
+
+  setLogTimeForwarder(fn: (node: string, project: string, noteableType: string, noteableIid: string, agentId: string, durationMs: number) => Promise<void>): void {
+    this.logTimeForwarder = fn
+  }
+
+  setCreateIssueForwarder(fn: (node: string, project: string, title: string, description: string, labels: string[], assignees: string[], agentId: string) => Promise<{ iid: number; url: string } | null>): void {
+    this.createIssueForwarder = fn
+  }
+
+  setSetLabelsForwarder(fn: (node: string, project: string, kind: "issue" | "merge_request", iid: string, add: string[], remove: string[], agentId: string) => Promise<string[] | null>): void {
+    this.setLabelsForwarder = fn
+  }
+
+  /** Inject the project rules store. Called once at daemon boot. */
+  setProjectRules(rules: import("@/projects/rules").ProjectRulesStore): void {
+    this.rules = rules
+  }
+
+  onMessage(handler: (msg: IncomingMessage) => Promise<void>): void {
+    this.handler = handler
+  }
+
+  /** Give every agent without an explicit agentMappings row its default
+   *  @-mention usernames. Returns the agents that got one. */
+  private deriveDefaultMappings(): string[] {
+    // Auto-derived defaults: every agent in the daemon that doesn't have an
+    // explicit `agentMappings` row gets a default entry so @-mentions route
+    // without operators hand-maintaining a parallel list.
+    //
+    // Convention: `@<agentId>` routes to the agent, and so does
+    // `@<prefix><agentId>` for each configured agentUsernamePrefixes entry
+    // (an organisation's bot-naming scheme). Author explicit entries in
+    // agentMappings when an agent needs a per-agent token or a non-standard
+    // username.
+    const explicitAgentIds = new Set((this.config.agentMappings ?? []).map((m) => m.agentId))
+    const autoMapped: string[] = []
+    for (const agentId of this.config.knownAgentIds ?? []) {
+      if (explicitAgentIds.has(agentId)) continue
+      // Skip internal/utility ids that aren't actual agents in the GitLab
+      // sense (e.g. "graph-agent" only ever talks on the a2a mesh).
+      const defaultUsernames = [agentId, ...(this.config.agentUsernamePrefixes ?? []).map((p) => `${p}${agentId}`)]
+      for (const username of defaultUsernames) {
+        this.botUsernames.add(username)
+        if (!this.usernameToAgent.has(username.toLowerCase())) {
+          this.usernameToAgent.set(username.toLowerCase(), agentId)
+        }
+      }
+      if (!this.agentToUsername.has(agentId)) {
+        this.agentToUsername.set(agentId, agentId.toLowerCase())
+      }
+      autoMapped.push(agentId)
+    }
+    return autoMapped
+  }
+
+  async start(): Promise<void> {
+    // Resolve bot usernames from ALL tokens (global + per-agent)
+    // This is critical for cascade prevention — we must know every username
+    // that posts on behalf of an agent.
+    const tokensToResolve: Array<{ label: string; token: string }> = []
+
+    if (this.config.token) {
+      tokensToResolve.push({ label: "global", token: this.config.token })
+    }
+    for (const mapping of this.config.agentMappings || []) {
+      if (mapping.token) {
+        tokensToResolve.push({ label: mapping.agentId, token: mapping.token })
+      }
+    }
+
+    // Resolve usernames from all tokens in parallel
+    const resolutions = await Promise.allSettled(
+      tokensToResolve.map(async ({ label, token }) => {
+        const res = await fetch(`${this.config.host}/api/v4/user`, {
+          headers: { "PRIVATE-TOKEN": token },
+        })
+        if (!res.ok) throw new Error(`${res.status}`)
+        const data = await res.json() as any
+        return { label, username: data.username as string }
+      })
+    )
+
+    for (const result of resolutions) {
+      if (result.status === "fulfilled") {
+        const { label, username } = result.value
+        this.botUsernames.add(username)
+        this.postingUsernames.add(username.toLowerCase())
+        if (label === "global") {
+          this.botUsername = username
+          this.log(`Global bot user: ${username}`)
+        } else {
+          // Map actual username <-> agentId (authoritative — from API, not config)
+          this.usernameToAgent.set(username.toLowerCase(), label)
+          this.agentToUsername.set(label, username.toLowerCase())
+          this.log(`Agent "${label}" -> GitLab user @${username}`)
+        }
+      }
+    }
+
+    // Also register configured gitlabUsernames for cascade prevention
+    // AND as fallback mention matching (if token resolution failed)
+    for (const mapping of this.config.agentMappings || []) {
+      for (const username of mapping.gitlabUsernames) {
+        this.botUsernames.add(username)
+        // Remote-routed mappings (node property) take explicit priority over token resolution.
+        // Token resolution is authoritative only for local agents.
+        const alreadySet = this.usernameToAgent.has(username.toLowerCase())
+        if (!alreadySet || mapping.node) {
+          this.usernameToAgent.set(username.toLowerCase(), mapping.agentId)
+        }
+      }
+      // Fallback: if token resolution didn't set agentToUsername, use first configured username
+      if (!this.agentToUsername.has(mapping.agentId) && mapping.gitlabUsernames.length > 0) {
+        this.agentToUsername.set(mapping.agentId, mapping.gitlabUsernames[0].toLowerCase())
+      }
+    }
+
+    const autoMapped = this.deriveDefaultMappings()
+
+    this.log(`Bot users (${this.botUsernames.size}): ${[...this.botUsernames].join(", ")}`)
+    this.log(`Username->Agent map: ${[...this.usernameToAgent.entries()].map(([u, a]) => `@${u}->${a}`).join(", ")}`)
+    if (autoMapped.length > 0) {
+      this.log(`GitLab auto-derived defaults for ${autoMapped.length} agent(s): ${autoMapped.join(", ")} (override by adding an agentMappings entry)`)
+    }
+
+    this.server = createServer(async (req, res) => {
+      if (req.method === "POST") {
+        await this.handleWebhook(req, res)
+      } else {
+        res.writeHead(200, { "Content-Type": "text/plain" })
+        res.end("GitLab webhook endpoint. POST events here.")
+      }
+    })
+
+    this.server.on("error", (err: any) => {
+      if (err.code === "EADDRINUSE") {
+        this.log(`GitLab webhook port ${this.config.webhookPort} in use, retrying in 5s...`)
+        setTimeout(() => {
+          this.server?.close()
+          this.server?.listen(this.config.webhookPort)
+        }, 5000)
+      } else {
+        this.log(`GitLab webhook server error: ${err.message}`)
+      }
+    })
+
+    this.server.listen(this.config.webhookPort, () => {
+      this.log(`GitLab webhook listening on :${this.config.webhookPort}`)
+    })
+  }
+
+  async stop(): Promise<void> {
+    if (this.server) this.server.close()
+  }
+
+  /**
+   * Send a reply — posts a comment back to GitLab via API.
+   * chatId format: "project:noteable_type:iid" (e.g. "org/project:issue:123")
+   */
+  async send(msg: OutgoingMessage): Promise<string> {
+    // chatId format: "group/project:type:iid" — split from the end
+    const parts = msg.chatId.split(":")
+    if (parts.length < 3) {
+      this.log(`Invalid chatId for GitLab reply: ${msg.chatId}`)
+      return ""
+    }
+    const iid = parts.pop()!
+    const noteableType = parts.pop()!
+    const project = parts.join(":") // rejoin in case project path had colons
+
+    const encodedProject = encodeURIComponent(project)
+    let endpoint: string
+
+    switch (noteableType) {
+      case "issue":
+        endpoint = `${this.config.host}/api/v4/projects/${encodedProject}/issues/${iid}/notes`
+        break
+      case "merge_request":
+        endpoint = `${this.config.host}/api/v4/projects/${encodedProject}/merge_requests/${iid}/notes`
+        break
+      default:
+        this.log(`Unsupported noteable type: ${noteableType}`)
+        return ""
+    }
+
+    // Identity rules — posts must go out under the agent's own GitLab user,
+    // never under the shared group-access-token user (e.g. @group_<id>_bot_*):
+    //
+    //   1. If the agent has a per-agent token configured locally → use it.
+    //   2. Else if the agent lives on a remote peer (explicit mapping.node,
+    //      or discovered via the mesh directory — same fallback that routed
+    //      the @mention here in the first place) and a sendNoteForwarder is
+    //      wired → forward the post there. The peer uses its own local token
+    //      (owned by that agent's GitLab user) to POST.
+    //   3. Else fall back to the global token (signed content from a generic
+    //      shared identity — legacy path, only reached for local agents with
+    //      no token mapping).
+    const target = this.resolvePostTarget(msg.agentId)
+    const agentToken = target.token
+    if (!agentToken && target.node && this.sendNoteForwarder) {
+      try {
+        const body = markBody(msg.text, msg.agentId || "unknown")
+        const noteId = await this.sendNoteForwarder(target.node, project, noteableType, iid, msg.agentId || "", body)
+        if (noteId) this.sentNoteIds.add(noteId)
+        return noteId
+      } catch (e: any) {
+        this.log(`GitLab send forward to "${target.node}" failed: ${e.message} — skipping (would post as group bot)`)
+        return ""
+      }
+    }
+
+    const token = agentToken || this.config.token
+    if (!agentToken && msg.agentId) {
+      // Global-token fallback. The note will appear in GitLab as authored
+      // by the global bot user (devops-acme), not the requesting agent.
+      // Mark in journalctl (not just debug.webhook) so operators can spot
+      // misattribution without flipping AGENTX_WEBHOOK_DEBUG.
+      this.log(`[gitlab/identity] note from "${msg.agentId}" using GLOBAL token (${this.botUsername || "shared bot"}) — agent has no per-agent token`)
+    }
+    debug.webhook("gitlab", "send", `agentId="${msg.agentId}" token=${agentToken ? "per-agent" : "GLOBAL(" + this.botUsername + ")"}`)
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "PRIVATE-TOKEN": token,
+        },
+        // Append hidden signature so we can detect our own comments on webhook
+        body: JSON.stringify({ body: markBody(msg.text, msg.agentId || "unknown") }),
+      })
+
+      if (!res.ok) {
+        const text = await res.text()
+        this.log(`GitLab API error: ${res.status} ${text}`)
+        return ""
+      }
+
+      const data = await res.json() as any
+      const noteId = String(data.id || "")
+      if (noteId) this.sentNoteIds.add(noteId)
+      return noteId
+    } catch (e: any) {
+      this.log(`GitLab send error: ${e.message}`)
+      return ""
+    }
+  }
+
+  // --- Webhook handling ---
+
+  private async handleWebhook(req: HttpRequest, res: ServerResponse): Promise<void> {
+    // Validate secret
+    if (this.config.webhookSecret) {
+      const token = req.headers["x-gitlab-token"]
+      if (token !== this.config.webhookSecret) {
+        res.writeHead(401, { "Content-Type": "application/json" })
+        res.end(JSON.stringify({ error: "Invalid token" }))
+        return
+      }
+    }
+
+    const body = await this.readBody(req)
+    const event = body as GitLabEvent
+    const objectKind = ((event as any).object_kind || (event as any).event_type || "unknown") as string
+
+    this.log(`Event: ${objectKind} from ${(event as any).project?.path_with_namespace || "unknown"}`)
+
+    // Route based on event type
+    switch (objectKind) {
+      case "note":
+        await this.handleNote(event as GitLabNoteEvent, res)
+        break
+      case "issue":
+        await this.handleIssue(event as GitLabIssueEvent, res)
+        break
+      case "merge_request":
+        await this.handleMR(event as GitLabMREvent, res)
+        break
+      case "pipeline":
+        await this.handlePipeline(event as GitLabPipelineEvent, res)
+        break
+      default:
+        this.log(`Unhandled event: ${objectKind}`)
+        res.writeHead(200)
+        res.end("ok")
+    }
+  }
+
+  /**
+   * Handle note/comment events — the primary use case.
+   * Routes @mention comments to the right agent.
+   */
+  private async handleNote(event: GitLabNoteEvent, res: ServerResponse): Promise<void> {
+    if (!this.handler) { res.writeHead(200); res.end("ok"); return }
+
+    const note = event.object_attributes.note
+    const project = event.project.path_with_namespace
+    const user = event.user
+    const noteId = String(event.object_attributes.id)
+
+    // PRIMARY CASCADE PREVENTION: Check for AgentX signature.
+    // Every comment posted by AgentX has <!-- agentx:AGENT_ID --> appended.
+    // This is the most reliable check — immune to race conditions and
+    // username misconfiguration. Only from an account an agent posts with
+    // (a token owner, a configured or known bot username): anyone can type
+    // the signature, and it must not hide their note or relabel it (#287).
+    const sourceAgent = this.postsAs(user.username) || this.isBotUser(user.username)
+      ? detectAgentxMarker(note)
+      : null
+    if (sourceAgent) {
+      // Allow bot-to-bot handoff: if an agent's comment @mentions a DIFFERENT agent
+      const mentions = note.match(/@(\w[\w.-]*)/g)?.map(m => m.slice(1).replace(/[.]+$/, "")) || []
+      const mentionsDifferentAgent = mentions.some(m => {
+        const targetAgent = this.usernameToAgent.get(m.toLowerCase())
+        return targetAgent && targetAgent !== sourceAgent
+      })
+      if (!mentionsDifferentAgent) {
+        this.log(`AgentX comment from ${sourceAgent}, no cross-agent mention, skipping (note ${noteId})`)
+        res.writeHead(200); res.end("ok"); return
+      }
+      this.log(`Bot-to-bot handoff: ${sourceAgent} → ${mentions.join(", ")} (note ${noteId})`)
+    }
+
+    // SECONDARY: Also check sentNoteIds (catches race with signature)
+    if (this.sentNoteIds.has(noteId)) {
+      this.sentNoteIds.delete(noteId)
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // TERTIARY: Skip comments from known bot users that have no @mentions
+    // (catches comments posted via CLI tools without the signature)
+    const mentions = note.match(/@(\w[\w.-]*)/g)?.map(m => m.slice(1).replace(/[.]+$/, "")) || []
+    if (mentions.length === 0) {
+      this.log(`No @mention in note ${noteId}, skipping`)
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    if (this.isBotUser(user.username) && !sourceAgent) {
+      this.log(`Bot comment from ${user.username} without signature, skipping (note ${noteId})`)
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Determine the noteable context
+    let noteableType = ""
+    let noteableIid = ""
+    let noteableTitle = ""
+    if (event.issue) {
+      noteableType = "issue"
+      noteableIid = String(event.issue.iid)
+      noteableTitle = stripAgentxMarkers(event.issue.title)
+    } else if (event.merge_request) {
+      noteableType = "merge_request"
+      noteableIid = String(event.merge_request.iid)
+      noteableTitle = stripAgentxMarkers(event.merge_request.title)
+    }
+
+    // Project-rule note filter — runs AFTER cascade-prevention so we don't
+    // log "rule dropped" for our own bot replies, but BEFORE expensive
+    // resolveAgent + downstream dispatch. Drops comments whose noteable
+    // type isn't in `onlyOn`, comments from excluded authors, and comments
+    // missing every required `triggers` (mention/keyword) match.
+    // Build the @-handle list once for the `triggers: [auto]` sentinel.
+    // usernameToAgent is populated at startup from each agent's GitLab
+    // token (the actual `/user.username` API value), so this stays
+    // authoritative even if config drifts from reality. Adding "@"
+    // prefix mirrors how mentions appear in raw comment text.
+    const knownAgentMentions = Array.from(this.usernameToAgent.keys()).map((u) => `@${u}`)
+    const noteRuleDecision = this.rules?.shouldFireGitlabNote(project, {
+      noteableType,
+      text: note,
+      authorUsername: user.username,
+    }, { knownAgentMentions })
+    if (noteRuleDecision && !noteRuleDecision.allow) {
+      this.log(`Note ${noteId} on ${project} ${noteableType}#${noteableIid} dropped by rule: ${noteRuleDecision.reason}`)
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Fire `on:gitlab-note` hook so workflow subscribers (mr-fix-loop) can
+    // route off note transitions in a structured way. Same fail-soft shape
+    // as on:gitlab-mr — hook errors don't block the legacy default-target
+    // dispatch below. Hook fires AFTER the project rule's note clause has
+    // approved the event so workflows see a pre-filtered event stream.
+    let workflowClaimedNote = false
+    if (this.hooks?.has("on:gitlab-note" as any)) {
+      try {
+        const result = await this.hooks.execute("on:gitlab-note" as any, {
+          event: "on:gitlab-note" as any,
+          noteEvent: event,
+          project,
+          noteId,
+          noteableType,
+          noteableIid,
+          noteableTitle,
+          text: note,
+          authorUsername: user.username,
+          author: user.username,
+          // The agentx signature is authoritative for who wrote the note —
+          // agents on the shared global token all post as one GitLab user.
+          authorAgent: sourceAgent ?? this.usernameToAgent.get(user.username.toLowerCase()) ?? null,
+          mentions,
+        })
+        const claimed = (result?.modified as { __workflowClaimed?: unknown } | undefined)?.__workflowClaimed
+        if (Array.isArray(claimed) && claimed.length > 0) {
+          workflowClaimedNote = true
+          this.log(`[handleNote] note ${noteId} claimed by workflow(s) ${(claimed as string[]).join(", ")} — skipping legacy @-mention dispatch`)
+        }
+      } catch (e: any) {
+        this.log(`on:gitlab-note hook error: ${e.message}`)
+      }
+    }
+    if (workflowClaimedNote) {
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Resolve agent deterministically from GitLab @mention -> usernameToAgent map.
+    debug.webhook("gitlab", "handleNote", `noteId=${noteId} mentions=[${mentions.join(",")}] user=${user.username}`)
+
+    const resolved = this.resolveAgentFromMention(note)
+    const resolvedAgentId = resolved?.agentId
+    const resolvedFromMesh = resolved?.node
+    debug.webhook("gitlab", "resolve", `agentId=${resolvedAgentId ?? "NONE"}${resolvedFromMesh ? ` peer=${resolvedFromMesh}` : ""}`)
+
+    if (!resolvedAgentId) {
+      this.log(`[handleNote] @mentions in note ${noteId} are not agents (${mentions.join(", ")}), skipping`)
+      // Phase 1 commit 6.a-extended (note path): record the halt — this
+      // is a real dispatch decision (@mention names that don't resolve),
+      // distinct from the cascade-prevention early returns above.
+      if (getLedgerMode("gitlab") !== "off") {
+        try {
+          recordGitLabNoteDispatch(
+            getDefaultLedger(),
+            {
+              noteId, project,
+              noteableType, noteableIid,
+              mentions: mentions.map((m) => m.toLowerCase()),
+            },
+            JSON.stringify(event),
+            { agentId: null, outcome: "halted", reason: `unresolved-mentions: ${mentions.join(",")}` },
+          )
+        } catch (e: any) {
+          this.log(`[ledger] gitlab note ${noteId} (no-resolve) record failed: ${e?.message ?? e}`)
+        }
+      }
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    const targetAgentId = resolvedAgentId
+
+    // React with 👀 using the RESOLVED agent's own token (deterministic identity).
+    // Three resolution paths:
+    //   1. Explicit `agentMappings[]` entry on this node (legacy) — may have
+    //      its own `token` (post here) or `node` (forward to peer).
+    //   2. Mesh fallback (resolvedFromMesh set) — no local mapping, peer owns
+    //      both the agent and the GitLab token. Forward react to peer.
+    //   3. Local agent with no mapping — agentNode/agentToken both undefined;
+    //      reactToNote skips silently.
+    const agentMapping = this.config.agentMappings?.find(m => m.agentId === targetAgentId)
+    const agentToken = agentMapping?.token
+    const agentNode = (agentMapping as any)?.node as string | undefined ?? resolvedFromMesh
+    debug.webhook("gitlab", "token", `agent="${targetAgentId}" mapping=${agentMapping ? "found" : "MISSING"} hasToken=${!!agentToken} node=${agentNode ?? "local"}${resolvedFromMesh ? " (via mesh)" : ""}`)
+    this.reactToNote(project, noteableType, noteableIid, event.object_attributes.id, agentToken, agentNode, targetAgentId).catch(() => {})
+
+    const chatId = `${project}:${noteableType}:${noteableIid}`
+
+    const channelMeta = await this.getChannelMeta(chatId)
+
+    // Download any images attached in the comment
+    const noteClean = stripAgentxMarkers(note)
+    const imageAttachment = await this.downloadNoteImages(noteClean, project, agentToken || this.config.token)
+
+    // Phase 1 / 6 — record the note dispatch first so we can tag the
+    // IncomingMessage with intentRef for resolution writes.
+    let intentRef: { eventId: string; decidedBy: string } | undefined
+    if (getLedgerMode("gitlab") !== "off") {
+      try {
+        const decision = recordGitLabNoteDispatch(
+          getDefaultLedger(),
+          {
+            noteId, project,
+            noteableType, noteableIid,
+            mentions: mentions.map((m) => m.toLowerCase()),
+          },
+          JSON.stringify(event),
+          { agentId: targetAgentId, outcome: "dispatched", reason: `mention:${mentions[0]}` },
+        )
+        if (decision.outcome === "dispatched") {
+          intentRef = { eventId: decision.eventId, decidedBy: decision.decidedBy }
+        }
+      } catch (e: any) {
+        this.log(`[ledger] gitlab note ${noteId} record failed: ${e?.message ?? e}`)
+      }
+    }
+
+    const incoming: IncomingMessage = {
+      id: String(event.object_attributes.id),
+      channel: "gitlab",
+      accountId: "default",
+      // A signed note is an agent's handoff even when it was posted with a
+      // person's token (#282) — the signature, read before stripping, says so.
+      sender: forgeSender(note, { id: chatId, name: user.name, username: user.username }, this.postsAs(user.username)),
+      text: `[GitLab ${project} ${noteableType} #${noteableIid}: ${noteableTitle}]\n${forgeAuthorLabel(note, user.name, this.postsAs(user.username))} commented:\n${noteClean}`,
+      timestamp: new Date(),
+      raw: event,
+      resolvedAgent: targetAgentId,
+      preferNode: agentMapping?.node ?? resolvedFromMesh,
+      channelMeta: channelMeta ? { ...channelMeta, issue: { type: noteableType, iid: noteableIid, title: noteableTitle } } : undefined,
+      media: imageAttachment,
+      intentRef,
+      runbookPath: this.rules?.find(project)?.runbook,
+      runbookFiles: this.rules?.find(project)?.runbookFiles,
+    }
+
+    this.handler(incoming).catch((e) => {
+      this.log(`Error handling note: ${e.message}`)
+    })
+
+    res.writeHead(200)
+    res.end("ok")
+  }
+
+  /**
+   * Handle issue events (opened, updated, closed).
+   * Only routes events from human users, not bot-triggered updates.
+   */
+  private async handleIssue(event: GitLabIssueEvent, res: ServerResponse): Promise<void> {
+    if (!this.handler) { res.writeHead(200); res.end("ok"); return }
+
+    const attrs = event.object_attributes
+    const project = event.project.path_with_namespace
+    const defaultAgentId = this.resolveAgent(project)
+
+    // Project rules — earliest filter. If a rule exists for this project and
+    // its issue clause rejects (action/labels/state/author), drop the event
+    // entirely: no hook fires, no default dispatch, no agent task runs.
+    // This is what stops triage feedback loops (re-fire on every label
+    // change) and prevents agents from intervening on closed issues, etc.
+    // GitLab payloads carry labels at object_attributes.labels (array of
+    // {title} or strings) or top-level event.labels — typed schema doesn't
+    // declare either field; the runtime payload does.
+    const attrsLabelsRaw = (attrs as any).labels
+    const eventLabelsRaw = (event as any).labels
+    const ruleLabels = Array.isArray(attrsLabelsRaw)
+      ? attrsLabelsRaw.map((l: any) => typeof l === "string" ? l : l?.title).filter(Boolean)
+      : (Array.isArray(eventLabelsRaw) ? eventLabelsRaw.map((l: any) => l?.title).filter(Boolean) : [])
+    const ruleDecision = this.rules?.shouldFireGitlabIssue(project, {
+      action: attrs.action,
+      state: attrs.state,
+      labels: ruleLabels,
+      authorUsername: event.user.username,
+    })
+    if (ruleDecision && !ruleDecision.allow) {
+      this.log(`Issue #${attrs.iid} dropped by rule: ${ruleDecision.reason}`)
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Bot-authored issue events (label changes, assignments by agents) skip
+    // the DEFAULT agent dispatch path to prevent cascade loops — but still
+    // fire the `on:gitlab-issue` hook below so workflow subscribers and
+    // custom hook handlers can opt in to them. This matters for BPM-style
+    // workflows (gitlab-sdlc-loop, etc.) that want to react to every label
+    // transition, including bot-driven ones.
+    const authoredByBot = this.isBotUser(event.user.username)
+    if (authoredByBot) {
+      this.log(`Issue #${attrs.iid} authored by bot "${event.user.username}" — default dispatch suppressed (hooks still fire)`)
+    }
+
+    // Resolve the per-project runbook hint once — stamped onto every
+    // IncomingMessage emitted from this handler so the registry can read
+    // CLAUDE.md / AGENTS.md / DEPLOY.md from the project root rather than
+    // the agent's generic workspace.
+    const projectRule = this.rules?.find(project)
+    const runbookPath = projectRule?.runbook
+    const runbookFiles = projectRule?.runbookFiles
+
+    // Fire `on:gitlab-issue` hook so projects can customize routing — e.g.
+    // trigger a specific agent on assignment rather than the project default.
+    // The hook may:
+    //   - return `blocked: true` to suppress the default dispatch
+    //   - return `modified.dispatch: Array<{ agentId, preferNode?, prompt? }>`
+    //     to dispatch to one or more specific agents (skips default)
+    //   - return nothing, letting the default project-agent behavior run
+    // The event body stays inside the context so hook scripts have full detail
+    // (changes.assignees, attrs.assignees, labels, etc.) without us re-parsing.
+    // Compute change-diffs once so hook subscribers + workflow filters can
+    // gate on "this update added a new assignee / label" rather than just
+    // the coarse `action=update` signal. Empty arrays when not an update
+    // event or no diff present.
+    const issuePrevAssignees = new Set((event.changes?.assignees?.previous ?? []).map((a) => a.username.toLowerCase()))
+    const issueAssigneesAdded = (event.changes?.assignees?.current ?? [])
+      .map((a) => a.username.toLowerCase())
+      .filter((u) => !issuePrevAssignees.has(u))
+    const issueLabelsAdded = extractLabelDiff((event as any).changes?.labels)
+
+    let dispatch: Array<{ agentId: string; preferNode?: string; prompt?: string; assignee?: string }> | undefined
+    let hookBlocked = false
+    if (this.hooks?.has("on:gitlab-issue" as any)) {
+      try {
+        const result = await this.hooks.execute("on:gitlab-issue" as any, {
+          event: "on:gitlab-issue" as any,
+          issueEvent: event,
+          project,
+          iid: attrs.iid,
+          title: attrs.title,
+          description: attrs.description || "",
+          url: attrs.url,
+          action: attrs.action,
+          author: event.user.username,
+          authorAgent: this.usernameToAgent.get(event.user.username.toLowerCase()) ?? null,
+          assigneesAdded: issueAssigneesAdded,
+          labelsAdded: issueLabelsAdded,
+          usernameToAgent: Object.fromEntries(this.usernameToAgent.entries()),
+          agentMappings: this.config.agentMappings || [],
+          defaultAgentId: defaultAgentId || null,
+        })
+        if (result.blocked) {
+          hookBlocked = true
+        }
+        // trigger.hook subscribers signal claim via modified.__workflowClaimed
+        // so the legacy default-route dispatch is suppressed when a workflow
+        // owns the event. Without this, the same agent gets spawned twice
+        // for one issue event (once via the workflow run, once via the
+        // project's default-agent route below).
+        const claimed = (result?.modified as { __workflowClaimed?: unknown } | undefined)?.__workflowClaimed
+        if (Array.isArray(claimed) && claimed.length > 0) {
+          hookBlocked = true
+          this.log(`Issue #${attrs.iid} claimed by workflow(s) ${(claimed as string[]).join(", ")} — default dispatch suppressed`)
+        }
+        const modDispatch = (result.modified as any)?.dispatch
+        if (Array.isArray(modDispatch) && modDispatch.length > 0) {
+          dispatch = modDispatch.filter((d: any) => d && typeof d.agentId === "string")
+        }
+      } catch (e: any) {
+        this.log(`on:gitlab-issue hook error: ${e.message}`)
+      }
+    }
+
+    // Hook-driven dispatch: route one IncomingMessage per dispatch entry.
+    if (dispatch && dispatch.length > 0) {
+      const ledgerEnabled = getLedgerMode("gitlab") !== "off"
+      const issueProjectionForHook = ledgerEnabled
+        ? {
+            entityKind: "issue" as const,
+            project,
+            iid: attrs.iid,
+            action: attrs.action,
+            title: attrs.title,
+            description: attrs.description,
+            url: attrs.url,
+          }
+        : null
+      const eventJsonForHook = ledgerEnabled ? JSON.stringify(event) : ""
+
+      for (const d of dispatch) {
+        const mapping = this.config.agentMappings?.find((m) => m.agentId === d.agentId)
+        const chatId = `${project}:issue:${attrs.iid}`
+        const channelMeta = await this.getChannelMeta(chatId)
+        const id = `issue-hook-${attrs.iid}-${d.agentId}${d.assignee ? `-${d.assignee}` : ""}-${attrs.action}`
+
+        // Phase 1 / 6 — record per-target hook dispatch first so we can
+        // tag the IncomingMessage with intentRef for resolution writes
+        // when the agent task completes.
+        let intentRef: { eventId: string; decidedBy: string } | undefined
+        if (issueProjectionForHook) {
+          try {
+            const decision = recordGitLabTargetDispatch(
+              getDefaultLedger(),
+              issueProjectionForHook,
+              { agentId: d.agentId, trigger: "hook-dispatch" },
+              eventJsonForHook,
+              { agentId: d.agentId, outcome: "dispatched", reason: d.preferNode ? `hook (node:${d.preferNode})` : "hook" },
+            )
+            if (decision.outcome === "dispatched") {
+              intentRef = { eventId: decision.eventId, decidedBy: decision.decidedBy }
+            }
+          } catch (e: any) {
+            this.log(`[ledger] gitlab issue #${attrs.iid} hook-dispatch ${d.agentId} record failed: ${e?.message ?? e}`)
+          }
+        }
+
+        const incoming: IncomingMessage = {
+          id,
+          channel: "gitlab",
+          accountId: "default",
+          sender: {
+            id: chatId,
+            name: event.user.name,
+            username: event.user.username,
+          },
+          text: d.prompt || `[GitLab ${project} Issue #${attrs.iid} ${attrs.action}]: ${stripAgentxMarkers(attrs.title)}\n${forgeBody(attrs.description, this.bodyTrusted(event))?.slice(0, 500) || ""}\nURL: ${attrs.url}`,
+          timestamp: new Date(),
+          raw: event,
+          resolvedAgent: d.agentId,
+          preferNode: d.preferNode || mapping?.node,
+          channelMeta: channelMeta ? {
+            ...channelMeta,
+            issue: { type: "issue", iid: String(attrs.iid), title: attrs.title },
+          } : undefined,
+          intentRef,
+          runbookPath,
+          runbookFiles,
+        }
+        this.log(`Issue #${attrs.iid} hook dispatch -> agent "${d.agentId}"${d.preferNode || mapping?.node ? ` (remote: ${d.preferNode || mapping?.node})` : ""}`)
+        this.handler(incoming).catch((e) => this.log(`Error handling hook dispatch: ${e.message}`))
+      }
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    if (hookBlocked) {
+      this.log(`Issue #${attrs.iid}: on:gitlab-issue hook suppressed default dispatch`)
+      // Phase 1 commit 6.a-extended (hook path): record the hook-blocked
+      // halt as an issue-level decision (no specific target). Distinct
+      // from per-target halts because no agent was even considered.
+      if (getLedgerMode("gitlab") !== "off") {
+        try {
+          recordGitLabIssueLevelDecision(
+            getDefaultLedger(),
+            {
+              entityKind: "issue",
+              project,
+              iid: attrs.iid,
+              action: attrs.action,
+              title: attrs.title,
+              description: attrs.description,
+              url: attrs.url,
+            },
+            "hook-blocked",
+            "gitlab:issue:hook",
+            JSON.stringify(event),
+            { agentId: null, outcome: "halted", reason: "on:gitlab-issue hook returned blocked:true" },
+          )
+        } catch (e: any) {
+          this.log(`[ledger] gitlab issue #${attrs.iid} hook-blocked record failed: ${e?.message ?? e}`)
+        }
+      }
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Bot-authored events: hook(s) above already ran; we stop before default
+    // agent dispatch to prevent cascade loops.
+    if (authoredByBot) { res.writeHead(200); res.end("ok"); return }
+
+    // Build a deterministic target set: mentions in description ∪ current
+    // assignees mapped to agents ∪ project default route. Each unique agent
+    // gets exactly one IncomingMessage. Replaces the prior "default route only"
+    // behavior so an issue assigned to an agent always gets that agent
+    // engaged — matching how comments resolve via @mention. The
+    // `on:gitlab-issue` hook above can still fully override or block.
+    const targets = this.computeIssueTargets(event, defaultAgentId)
+    if (targets.length === 0) {
+      this.log(`Issue #${attrs.iid}: no agent target (no mention, no agent assignee, no default route)`)
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Phase 1 commit 6.a: shadow-mode ledger observes the loop. We
+    // compute `wasDuplicate` up front (rather than `continue`-ing on
+    // legacy dedup hits) so the ledger sees BOTH branches — fresh
+    // dispatches AND legacy-deduped ones — and the divergence reporter
+    // surfaces gaps between the legacy TTL dedup and the ledger's
+    // active-task model. Both views live side-by-side until the 1c→1d
+    // promotions retire legacy dedup.
+    const ledgerEnabled = getLedgerMode("gitlab") !== "off"
+    const issueProjection = ledgerEnabled
+      ? {
+          entityKind: "issue" as const,
+          project,
+          iid: attrs.iid,
+          action: attrs.action,
+          title: attrs.title,
+          description: attrs.description,
+          url: attrs.url,
+        }
+      : null
+    const eventJson = ledgerEnabled ? JSON.stringify(event) : ""
+
+    for (const t of targets) {
+      const dedupKey = `${project}:issue:${attrs.iid}:${t.agentId}:${attrs.action}:${t.trigger}`
+      const wasDuplicate = this.isDispatchedRecently(dedupKey)
+
+      // Phase 1 / 6 — record ledger first so we have the decision row
+      // for the IncomingMessage's intentRef. Wrapped in try/catch because
+      // a ledger failure must never break dispatch — legacy stays
+      // authoritative until 1c.
+      let intentRef: { eventId: string; decidedBy: string } | undefined
+      if (issueProjection) {
+        try {
+          const decision = recordGitLabTargetDispatch(
+            getDefaultLedger(),
+            issueProjection,
+            t,
+            eventJson,
+            wasDuplicate
+              ? { agentId: null, outcome: "deduped", reason: "isDispatchedRecently" }
+              : { agentId: t.agentId, outcome: "dispatched" },
+          )
+          // Tag the IncomingMessage only when ledger ALSO decided
+          // "dispatched" (active-task safety could still force "deduped").
+          // Resolution writes only make sense for dispatched decisions.
+          if (decision.outcome === "dispatched") {
+            intentRef = { eventId: decision.eventId, decidedBy: decision.decidedBy }
+          }
+        } catch (e: any) {
+          this.log(`[ledger] gitlab issue #${attrs.iid} target ${t.agentId} record failed: ${e?.message ?? e}`)
+        }
+      }
+
+      if (wasDuplicate) {
+        this.log(`Issue #${attrs.iid}: skip duplicate dispatch ${dedupKey}`)
+      } else {
+        this.markDispatched(dedupKey)
+
+        const mapping = this.config.agentMappings?.find((m) => m.agentId === t.agentId)
+        const chatId = `${project}:issue:${attrs.iid}`
+        const channelMeta = await this.getChannelMeta(chatId)
+
+        // Assignment-trigger gets a "start working" prompt; mention/default
+        // get the standard issue summary. Both end with the issue URL so the
+        // agent can navigate to it.
+        const text = t.trigger === "assignee-added"
+          ? `[GitLab ${project} Issue #${attrs.iid} assigned to you: ${stripAgentxMarkers(attrs.title)}]\n${forgeBody(attrs.description, this.bodyTrusted(event))?.slice(0, 1500) || ""}\nURL: ${attrs.url}\n\nPlease acknowledge this assignment in a comment, then start working on the issue.`
+          : `[GitLab ${project} Issue #${attrs.iid} ${attrs.action}]: ${stripAgentxMarkers(attrs.title)}\n${forgeBody(attrs.description, this.bodyTrusted(event))?.slice(0, 500) || ""}\nURL: ${attrs.url}`
+
+        const incoming: IncomingMessage = {
+          id: `issue-${attrs.iid}-${attrs.action}-${t.agentId}-${t.trigger}`,
+          channel: "gitlab",
+          accountId: "default",
+          sender: {
+            id: chatId,
+            name: event.user.name,
+            username: event.user.username,
+          },
+          text,
+          timestamp: new Date(),
+          raw: event,
+          resolvedAgent: t.agentId,
+          preferNode: mapping?.node,
+          channelMeta: channelMeta ? {
+            ...channelMeta,
+            issue: { type: "issue", iid: String(attrs.iid), title: attrs.title },
+          } : undefined,
+          intentRef,
+          runbookPath,
+          runbookFiles,
+        }
+
+        this.log(`Issue #${attrs.iid} -> agent "${t.agentId}" (trigger: ${t.trigger})`)
+        this.handler(incoming).catch((e) => this.log(`Error handling issue: ${e.message}`))
+      }
+    }
+
+    res.writeHead(200)
+    res.end("ok")
+  }
+
+  /** Compute the deterministic target set for an issue event. Order:
+   *    1. agent usernames @mentioned in the description (open events)
+   *    2. agent usernames newly added as assignees (changes.assignees diff)
+   *    3. agent usernames in the current full assignee list (catches
+   *       create-with-assignee where there are no `changes`)
+   *    4. project default route (fallback only when 1-3 produced nothing)
+   *  Each agent appears at most once; the first trigger that found them
+   *  wins for the dedup key. */
+  private computeIssueTargets(
+    event: GitLabIssueEvent,
+    defaultAgentId: string | undefined,
+  ): Array<{ agentId: string; trigger: "mention" | "assignee-added" | "assignee-current" | "default-route" }> {
+    const out: Array<{ agentId: string; trigger: "mention" | "assignee-added" | "assignee-current" | "default-route" }> = []
+    const seen = new Set<string>()
+    const add = (agentId: string | undefined, trigger: "mention" | "assignee-added" | "assignee-current" | "default-route") => {
+      if (!agentId || seen.has(agentId)) return
+      seen.add(agentId)
+      out.push({ agentId, trigger })
+    }
+
+    // 1. Mentions in description
+    const desc = event.object_attributes.description || ""
+    const mentions = desc.match(/@(\w[\w.-]*)/g)?.map(m => m.slice(1).replace(/[.]+$/, "").toLowerCase()) || []
+    for (const u of mentions) {
+      add(this.usernameToAgent.get(u), "mention")
+    }
+
+    // 2. Newly added assignees (assignment trigger — the "start working" path)
+    const previous = new Set((event.changes?.assignees?.previous ?? []).map(a => a.username.toLowerCase()))
+    const current = (event.changes?.assignees?.current ?? []).map(a => a.username.toLowerCase())
+    for (const u of current) {
+      if (previous.has(u)) continue // unchanged assignment, not a fresh add
+      add(this.usernameToAgent.get(u), "assignee-added")
+    }
+
+    // 3. Current full assignee list (covers create-with-assignee where
+    //    `changes` is absent). Skipped when (2) already produced an agent
+    //    for this event to avoid the same assignee firing twice.
+    if (out.length === 0) {
+      const allAssignees = (event.assignees ?? []).map(a => a.username.toLowerCase())
+      for (const u of allAssignees) {
+        add(this.usernameToAgent.get(u), "assignee-current")
+      }
+    }
+
+    // 4. Project default route — only when nothing above resolved
+    if (out.length === 0) {
+      add(defaultAgentId, "default-route")
+    }
+
+    return out
+  }
+
+  /** Was this dispatch key fired within the dedup TTL window? */
+  private isDispatchedRecently(key: string): boolean {
+    const expires = this.dispatchedTargets.get(key)
+    if (!expires) return false
+    if (expires < Date.now()) {
+      this.dispatchedTargets.delete(key)
+      return false
+    }
+    return true
+  }
+
+  /** Record that we dispatched `key` and prune stale entries. */
+  private markDispatched(key: string): void {
+    const now = Date.now()
+    this.dispatchedTargets.set(key, now + this.DISPATCH_TTL_MS)
+    // Lazy prune: drop expired entries while we're touching the map.
+    if (this.dispatchedTargets.size > 200) {
+      for (const [k, exp] of this.dispatchedTargets) {
+        if (exp < now) this.dispatchedTargets.delete(k)
+      }
+    }
+  }
+
+  /**
+   * Handle merge request events.
+   */
+  private async handleMR(event: GitLabMREvent, res: ServerResponse): Promise<void> {
+    if (!this.handler) { res.writeHead(200); res.end("ok"); return }
+
+    // Skip bot-triggered MR updates (cascade prevention)
+    if (this.isBotUser(event.user.username)) {
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    const attrs = event.object_attributes
+    const project = event.project.path_with_namespace
+    const defaultAgentId = this.resolveAgent(project)
+
+    // Project-rule gate — same shape as handleIssue. When a rule exists
+    // and rejects the MR action/labels/state/author, drop the event before
+    // both the on:gitlab-mr hook and the default target dispatch fire.
+    // This is what stops "every MR update re-fires the review workflow"
+    // in the same way the issue rule stopped triage cascades.
+    const mrLabelsRaw = (attrs as any).labels
+    const mrEventLabels = (event as any).labels
+    const mrLabels = Array.isArray(mrLabelsRaw)
+      ? mrLabelsRaw.map((l: any) => typeof l === "string" ? l : l?.title).filter(Boolean)
+      : (Array.isArray(mrEventLabels) ? mrEventLabels.map((l: any) => l?.title).filter(Boolean) : [])
+    const mrRuleDecision = this.rules?.shouldFireGitlabMR(project, {
+      action: attrs.action,
+      state: attrs.state,
+      labels: mrLabels,
+      authorUsername: event.user.username,
+    })
+    if (mrRuleDecision && !mrRuleDecision.allow) {
+      this.log(`MR !${attrs.iid} on ${project} dropped by rule: ${mrRuleDecision.reason}`)
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Fire `on:gitlab-mr` hook so workflow subscribers (mr-review-fire,
+    // merge-deploy, etc.) can route off MR transitions. Mirror of the
+    // on:gitlab-issue contract — fail-soft: hook errors don't block the
+    // legacy default-target dispatch below.
+    // Compute change-diffs (mirror of handleIssue). Workflows can filter on
+    // assigneesAdded / reviewersAdded so e.g. a "review-on-assignment"
+    // workflow only fires when a NEW reviewer was added, not on every
+    // unrelated MR update.
+    const mrPrevAssignees = new Set((event.changes?.assignees?.previous ?? []).map((a) => a.username.toLowerCase()))
+    const mrAssigneesAdded = (event.changes?.assignees?.current ?? [])
+      .map((a) => a.username.toLowerCase())
+      .filter((u) => !mrPrevAssignees.has(u))
+    const mrPrevReviewers = new Set((event.changes?.reviewers?.previous ?? []).map((r) => r.username.toLowerCase()))
+    const mrReviewersAdded = (event.changes?.reviewers?.current ?? [])
+      .map((r) => r.username.toLowerCase())
+      .filter((u) => !mrPrevReviewers.has(u))
+    const mrLabelsAdded = extractLabelDiff((event as any).changes?.labels)
+
+    let workflowClaimedMR = false
+    if (this.hooks?.has("on:gitlab-mr" as any)) {
+      try {
+        const result = await this.hooks.execute("on:gitlab-mr" as any, {
+          event: "on:gitlab-mr" as any,
+          mrEvent: event,
+          project,
+          iid: attrs.iid,
+          title: attrs.title,
+          description: attrs.description || "",
+          url: attrs.url,
+          action: attrs.action,
+          state: attrs.state,
+          source_branch: attrs.source_branch,
+          target_branch: attrs.target_branch,
+          labels: mrLabels,
+          author: event.user.username,
+          authorAgent: this.usernameToAgent.get(event.user.username.toLowerCase()) ?? null,
+          assigneesAdded: mrAssigneesAdded,
+          reviewersAdded: mrReviewersAdded,
+          labelsAdded: mrLabelsAdded,
+          defaultAgentId: defaultAgentId || null,
+        })
+        // Suppress legacy default-target dispatch when a workflow has
+        // claimed this MR transition (set via modified.__workflowClaimed
+        // by the per-workflow trigger.hook handler in triggers.ts).
+        // Without this, the same agent gets spawned twice — once via the
+        // workflow run, once via the project's default-route dispatch.
+        const claimed = (result?.modified as { __workflowClaimed?: unknown } | undefined)?.__workflowClaimed
+        if (Array.isArray(claimed) && claimed.length > 0) {
+          workflowClaimedMR = true
+          this.log(`MR !${attrs.iid} claimed by workflow(s) ${(claimed as string[]).join(", ")} — default dispatch suppressed`)
+        }
+      } catch (e: any) {
+        this.log(`on:gitlab-mr hook error: ${e.message}`)
+      }
+    }
+    if (workflowClaimedMR) {
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Same target-resolution model as handleIssue: mentions ∪ assignees ∪
+    // reviewers ∪ default route, deduped per-agent.
+    const targets = this.computeMRTargets(event, defaultAgentId)
+    if (targets.length === 0) {
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Same shadow-mode wiring as handleIssue (Phase 1 commit 6.a). Computed
+    // once outside the loop; per-target ledger record happens after the
+    // legacy dispatch path so the ledger sees both fresh and deduped branches.
+    const ledgerEnabled = getLedgerMode("gitlab") !== "off"
+    const mrProjection = ledgerEnabled
+      ? {
+          entityKind: "merge_request" as const,
+          project,
+          iid: attrs.iid,
+          action: attrs.action,
+          title: attrs.title,
+          description: attrs.description,
+          url: attrs.url,
+        }
+      : null
+    const eventJson = ledgerEnabled ? JSON.stringify(event) : ""
+
+    for (const t of targets) {
+      const dedupKey = `${project}:merge_request:${attrs.iid}:${t.agentId}:${attrs.action}:${t.trigger}`
+      const wasDuplicate = this.isDispatchedRecently(dedupKey)
+
+      let intentRef: { eventId: string; decidedBy: string } | undefined
+      if (mrProjection) {
+        try {
+          const decision = recordGitLabTargetDispatch(
+            getDefaultLedger(),
+            mrProjection,
+            t,
+            eventJson,
+            wasDuplicate
+              ? { agentId: null, outcome: "deduped", reason: "isDispatchedRecently" }
+              : { agentId: t.agentId, outcome: "dispatched" },
+          )
+          if (decision.outcome === "dispatched") {
+            intentRef = { eventId: decision.eventId, decidedBy: decision.decidedBy }
+          }
+        } catch (e: any) {
+          this.log(`[ledger] gitlab MR !${attrs.iid} target ${t.agentId} record failed: ${e?.message ?? e}`)
+        }
+      }
+
+      if (!wasDuplicate) {
+        this.markDispatched(dedupKey)
+
+        const mapping = this.config.agentMappings?.find((m) => m.agentId === t.agentId)
+        const chatId = `${project}:merge_request:${attrs.iid}`
+        const channelMeta = await this.getChannelMeta(chatId)
+
+        const isAssignmentTrigger = t.trigger === "assignee-added" || t.trigger === "reviewer-added"
+        const text = isAssignmentTrigger
+          ? `[GitLab ${project} MR !${attrs.iid} ${t.trigger === "reviewer-added" ? "review requested" : "assigned to you"}: ${stripAgentxMarkers(attrs.title)}]\nBranch: ${attrs.source_branch} -> ${attrs.target_branch}\n${forgeBody(attrs.description, this.bodyTrusted(event))?.slice(0, 1500) || ""}\nURL: ${attrs.url}\n\nPlease acknowledge in a comment, then ${t.trigger === "reviewer-added" ? "review this MR" : "start working on it"}.`
+          : `[GitLab ${project} MR !${attrs.iid} ${attrs.action}]: ${stripAgentxMarkers(attrs.title)}\nBranch: ${attrs.source_branch} -> ${attrs.target_branch}\n${forgeBody(attrs.description, this.bodyTrusted(event))?.slice(0, 500) || ""}\nURL: ${attrs.url}`
+
+        const incoming: IncomingMessage = {
+          id: `mr-${attrs.iid}-${attrs.action}-${t.agentId}-${t.trigger}`,
+          channel: "gitlab",
+          accountId: "default",
+          sender: {
+            id: chatId,
+            name: event.user.name,
+            username: event.user.username,
+          },
+          text,
+          timestamp: new Date(),
+          raw: event,
+          resolvedAgent: t.agentId,
+          preferNode: mapping?.node,
+          channelMeta: channelMeta ? {
+            ...channelMeta,
+            issue: { type: "merge_request", iid: String(attrs.iid), title: attrs.title },
+          } : undefined,
+          intentRef,
+          runbookPath: this.rules?.find(project)?.runbook,
+          runbookFiles: this.rules?.find(project)?.runbookFiles,
+        }
+
+        this.log(`MR !${attrs.iid} -> agent "${t.agentId}" (trigger: ${t.trigger})`)
+        this.handler(incoming).catch((e) => this.log(`Error handling MR: ${e.message}`))
+      }
+    }
+
+    res.writeHead(200)
+    res.end("ok")
+  }
+
+  /** Compute MR targets — mirrors computeIssueTargets, with reviewer
+   *  changes added as a separate trigger so an agent added as reviewer
+   *  gets the "review this MR" prompt instead of "start working on it". */
+  private computeMRTargets(
+    event: GitLabMREvent,
+    defaultAgentId: string | undefined,
+  ): Array<{ agentId: string; trigger: "mention" | "assignee-added" | "assignee-current" | "reviewer-added" | "reviewer-current" | "default-route" }> {
+    const out: Array<{ agentId: string; trigger: "mention" | "assignee-added" | "assignee-current" | "reviewer-added" | "reviewer-current" | "default-route" }> = []
+    const seen = new Set<string>()
+    const add = (
+      agentId: string | undefined,
+      trigger: "mention" | "assignee-added" | "assignee-current" | "reviewer-added" | "reviewer-current" | "default-route",
+    ) => {
+      if (!agentId || seen.has(agentId)) return
+      seen.add(agentId)
+      out.push({ agentId, trigger })
+    }
+
+    const desc = event.object_attributes.description || ""
+    const mentions = desc.match(/@(\w[\w.-]*)/g)?.map(m => m.slice(1).replace(/[.]+$/, "").toLowerCase()) || []
+    for (const u of mentions) add(this.usernameToAgent.get(u), "mention")
+
+    const prevA = new Set((event.changes?.assignees?.previous ?? []).map(a => a.username.toLowerCase()))
+    for (const a of event.changes?.assignees?.current ?? []) {
+      const u = a.username.toLowerCase()
+      if (prevA.has(u)) continue
+      add(this.usernameToAgent.get(u), "assignee-added")
+    }
+    const prevR = new Set((event.changes?.reviewers?.previous ?? []).map(a => a.username.toLowerCase()))
+    for (const r of event.changes?.reviewers?.current ?? []) {
+      const u = r.username.toLowerCase()
+      if (prevR.has(u)) continue
+      add(this.usernameToAgent.get(u), "reviewer-added")
+    }
+
+    if (out.length === 0) {
+      for (const a of event.assignees ?? []) add(this.usernameToAgent.get(a.username.toLowerCase()), "assignee-current")
+      for (const r of event.reviewers ?? []) add(this.usernameToAgent.get(r.username.toLowerCase()), "reviewer-current")
+    }
+
+    if (out.length === 0) add(defaultAgentId, "default-route")
+    return out
+  }
+
+  /**
+   * Handle pipeline events (success, failed).
+   */
+  private async handlePipeline(event: GitLabPipelineEvent, res: ServerResponse): Promise<void> {
+    const attrs = event.object_attributes
+    const project = event.project.path_with_namespace
+    const terminalStatuses = ["success", "failed", "canceled"]
+
+    // Project rule — drop the entire pipeline event when the project's
+    // pipeline.actions whitelist excludes this status. Skips both the hook
+    // fire and the failure-routing default below.
+    const pipeRuleDecision = this.rules?.shouldFireGitlabPipeline(project, { status: attrs.status })
+    if (pipeRuleDecision && !pipeRuleDecision.allow) {
+      this.log(`Pipeline ${attrs.id} on ${project} dropped by rule: ${pipeRuleDecision.reason}`)
+      res.writeHead(200); res.end("ok"); return
+    }
+
+    // Fire on:gitlab-pipeline hook for all terminal pipelines (side-effect hooks, e.g. time logging)
+    if (terminalStatuses.includes(attrs.status) && this.hooks?.has("on:gitlab-pipeline" as any)) {
+      this.hooks.execute("on:gitlab-pipeline" as any, {
+        event: "on:gitlab-pipeline" as any,
+        pipelineId: attrs.id,
+        status: attrs.status,
+        ref: attrs.ref,
+        duration: attrs.duration,
+        project,
+        projectId: (event as any).project?.id,
+        author: (event as any).user?.username,
+        raw: event,
+      }).catch((e: Error) => this.log(`on:gitlab-pipeline hook error: ${e.message}`))
+    }
+
+    // Only route to agent on failures
+    if (!this.handler || attrs.status !== "failed") {
+      res.writeHead(200)
+      res.end("ok")
+      return
+    }
+
+    const agentId = this.resolveAgent(project)
+
+    const incoming: IncomingMessage = {
+      id: `pipeline-${attrs.id}`,
+      channel: "gitlab",
+      accountId: "default",
+      sender: {
+        id: `${project}:pipeline:${attrs.id}`,
+        name: event.user.name,
+        username: event.user.username,
+      },
+      // No group — sender.id has project:type:iid for reply routing
+      text: `[GitLab Pipeline FAILED] Project: ${project}\nRef: ${attrs.ref}\nDuration: ${attrs.duration}s\nPlease investigate the failure.`,
+      timestamp: new Date(),
+      raw: event,
+      resolvedAgent: agentId,
+      runbookPath: this.rules?.find(project)?.runbook,
+      runbookFiles: this.rules?.find(project)?.runbookFiles,
+    }
+
+    this.handler(incoming).catch((e) => this.log(`Error handling pipeline: ${e.message}`))
+    res.writeHead(200)
+    res.end("ok")
+  }
+
+  /**
+   * Resolve agent from @mentions in a comment.
+   * Uses the authoritative usernameToAgent map (built from API token resolution
+   * at startup) — not the manually configured gitlabUsernames which may be wrong.
+   */
+  private resolveAgentFromMention(text: string): { agentId: string; node?: string } | undefined {
+    // Extract @mentions from the comment, strip trailing dots/punctuation
+    const mentions = text.match(/@(\w[\w.-]*)/g)?.map(m => m.slice(1).replace(/[.]+$/, "").toLowerCase()) || []
+    if (mentions.length === 0) return undefined
+
+    // Check against the authoritative username->agent map (resolved from tokens
+    // + agentMappings). This is the local + explicit-remote (`node:` set on the
+    // mapping) path, identical to the legacy behavior.
+    for (const mention of mentions) {
+      const agentId = this.usernameToAgent.get(mention)
+      if (agentId) {
+        this.log(`Mention @${mention} -> agent "${agentId}" (resolved from local map)`)
+        return { agentId }
+      }
+    }
+
+    // Mesh fallback — check each healthy peer's agent-card skills. A skill's
+    // `tags` array carries up to 4 of the agent's `mentions` (set by the
+    // daemon's /.well-known/agent-card.json builder). This lets a remote
+    // agent receive @-mentions without operators having to hand-maintain a
+    // mirror `agentMappings` entry on every node where the mention might
+    // arrive — generic cross-mesh channel routing.
+    if (this.mesh) {
+      const directory = this.mesh.directory()
+      for (const peer of directory) {
+        if (!peer.healthy) continue
+        // Only consider peers that actually host the GitLab channel — posting
+        // a reply requires the peer to have the GitLab token wiring (peer
+        // endpoints /gitlab/send-note etc.). Skip peers without GitLab.
+        const hasGitlab = peer.channels?.includes("gitlab")
+        if (!hasGitlab) continue
+        for (const skill of peer.skills) {
+          // The skill id itself is a candidate (covers `@<agentId>`).
+          const skillCandidates = new Set<string>([skill.id.toLowerCase()])
+          for (const tag of skill.tags ?? []) {
+            const cleaned = String(tag).replace(/^@/, "").toLowerCase()
+            if (cleaned) skillCandidates.add(cleaned)
+          }
+          for (const mention of mentions) {
+            if (skillCandidates.has(mention)) {
+              this.log(`Mention @${mention} -> agent "${skill.id}" on mesh peer "${peer.peer}"`)
+              return { agentId: skill.id, node: peer.peer }
+            }
+          }
+        }
+      }
+    }
+
+    return undefined
+  }
+
+  /**
+   * Resolve which agent handles a project based on routes.
+   */
+  private resolveAgent(project: string): string | undefined {
+    for (const route of this.config.routes) {
+      if (route.project === project || route.project === "*") {
+        return route.agent
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Get verified context for a GitLab project chat.
+   * chatId format: "project/path:issue:123" or "project/path:merge_request:456"
+   */
+  async getChannelMeta(chatId: string): Promise<ChannelMeta | undefined> {
+    const parts = chatId.split(":")
+    const project = parts[0]
+    const noteableType = parts[1]
+    const noteableIid = parts[2]
+
+    // Find all agents mapped to this project
+    const agents: ChannelMeta["agents"] = []
+    for (const route of this.config.routes) {
+      if (route.project === project || route.project === "*") {
+        agents.push({ id: route.agent, name: route.agent })
+      }
+    }
+    for (const mapping of this.config.agentMappings || []) {
+      if (!agents.some(a => a.id === mapping.agentId)) {
+        agents.push({ id: mapping.agentId, name: mapping.agentId })
+      }
+    }
+
+    const facts: string[] = [
+      "This is a GitLab webhook event — respond as a GitLab comment",
+      "Do NOT use Telegram handles or delegate to other agents",
+      "Do NOT mention other agents by name — you are the only agent responding to this event",
+      "Stay in your role — do not act as or speak for other agents",
+    ]
+
+    return {
+      channel: "gitlab",
+      agents,
+      project,
+      issue: noteableType && noteableIid ? { type: noteableType, iid: noteableIid, title: "" } : undefined,
+      facts,
+    }
+  }
+
+  /** Is an issue/MR description ours to trust? The event's `user` is
+   *  whoever triggered it (an assign, an edit), not the author, so the
+   *  description keeps its marker only when an account AgentX posts with
+   *  both wrote it and triggered this event. */
+  private bodyTrusted(event: GitLabIssueEvent | GitLabMREvent): boolean {
+    const authorId = event.object_attributes.author_id
+    return event.user.id != null && authorId != null && event.user.id === authorId && this.postsAs(event.user.username)
+  }
+
+  /** True for a GitLab user AgentX posts as: the owner of one of its
+   *  tokens, or a configured gitlabUsernames entry (the loop guard's list). */
+  postsAs(username: string): boolean {
+    const lc = username.toLowerCase()
+    if (this.postingUsernames.has(lc)) return true
+    return mappedForgeUsernames(this.config.agentMappings, "gitlabUsernames").some((u) => u.toLowerCase() === lc)
+  }
+
+  /**
+   * Check if a username belongs to a known bot/agent user — local tokens,
+   * configured usernames, auto-derived ids, OR an agent hosted on a mesh
+   * peer (its GitLab usernames travel as agent-card skill tags, the same
+   * source resolveAgentFromMention uses). Without the mesh check, a peer
+   * agent's own API actions (replies, time logs → issue:update webhooks)
+   * look like human activity on the webhook node and re-dispatch agents
+   * in a feedback loop.
+   */
+  private isBotUser(username: string): boolean {
+    if (this.botUsernames.has(username)) return true
+    if (!this.mesh) return false
+    const lc = username.toLowerCase()
+    for (const peer of this.mesh.directory()) {
+      if (!peer.healthy) continue
+      for (const skill of peer.skills) {
+        if (skill.id.toLowerCase() === lc) return true
+        for (const tag of skill.tags ?? []) {
+          if (String(tag).replace(/^@/, "").toLowerCase() === lc) return true
+        }
+      }
+    }
+    return false
+  }
+
+  /** ChannelAdapter.seedHistory: fetch the issue/MR's existing notes from
+   *  the GitLab API and return them oldest-first so a fresh agent session
+   *  starts mirroring the live thread. chatId is the canonical
+   *  "project:type:iid" the rest of the adapter already uses (see send()).
+   *  Filters out agentx-signed notes from the calling agent (those are this
+   *  agent's own past replies — already represented in the model's prior
+   *  turns). Best-effort: API errors return [] rather than throwing. */
+  async seedHistory(
+    chatId: string,
+    opts: { sinceISO?: string; maxMessages: number; maxChars: number },
+  ): Promise<SeededMessage[]> {
+    const parts = chatId.split(":")
+    if (parts.length < 3) return []
+    const iid = parts.pop()!
+    const noteableType = parts.pop()!
+    const project = parts.join(":")
+
+    const encodedProject = encodeURIComponent(project)
+    let endpoint: string
+    if (noteableType === "issue") {
+      endpoint = `${this.config.host}/api/v4/projects/${encodedProject}/issues/${iid}/notes?sort=asc&per_page=${Math.max(20, Math.min(100, opts.maxMessages))}`
+    } else if (noteableType === "merge_request") {
+      endpoint = `${this.config.host}/api/v4/projects/${encodedProject}/merge_requests/${iid}/notes?sort=asc&per_page=${Math.max(20, Math.min(100, opts.maxMessages))}`
+    } else {
+      return []
+    }
+
+    // Use global token for the read — seedHistory is a context-rebuild
+    // operation, not an identity-bound action, and the global token is
+    // guaranteed to have read access across the configured projects.
+    const token = this.config.token
+    if (!token) return []
+
+    let notes: Array<{
+      id: number
+      body: string
+      author?: { username?: string; name?: string }
+      created_at: string
+      system?: boolean
+    }>
+    try {
+      const res = await fetch(endpoint, {
+        headers: { "PRIVATE-TOKEN": token },
+      })
+      if (!res.ok) return []
+      notes = (await res.json()) as typeof notes
+    } catch {
+      return []
+    }
+
+    const out: SeededMessage[] = []
+    let chars = 0
+    const sinceMs = opts.sinceISO ? new Date(opts.sinceISO).getTime() : 0
+    for (const n of notes) {
+      if (n.system) continue // skip GitLab-generated "assigned to / closed" lines
+      if (sinceMs && new Date(n.created_at).getTime() < sinceMs) continue
+      // Only a note posted by an account AgentX posts with can be an
+      // agent's; anyone can type the marker (see postsAs).
+      const sourceAgent = this.postsAs(n.author?.username ?? "") ? detectAgentxMarker(n.body) : null
+      const cleanBody = stripAgentxMarkers(n.body)
+      out.push({
+        role: sourceAgent ? "agent" : "user",
+        name: n.author?.name || n.author?.username || (sourceAgent ?? "user"),
+        content: cleanBody,
+        timestamp: n.created_at,
+        externalId: String(n.id),
+      })
+      chars += cleanBody.length
+      if (out.length >= opts.maxMessages) break
+      if (chars >= opts.maxChars) break
+    }
+    return out
+  }
+
+  /**
+   * Get the per-agent GitLab token from agentMappings.
+   * Falls back to undefined if no per-agent token is configured.
+   */
+  getAgentToken(agentId?: string): string | undefined {
+    if (!agentId || !this.config.agentMappings?.length) return undefined
+    const mapping = this.config.agentMappings.find(m => m.agentId === agentId)
+    return mapping?.token
+  }
+
+  /**
+   * Resolve where a GitLab write (note / time-log / issue / labels) for
+   * `agentId` should execute. Single source of truth for every writer,
+   * mirroring `resolveAgentFromMention`'s precedence — an agent that can
+   * RECEIVE a mention via the mesh directory must also be able to POST
+   * under its own identity, or replies die silently on the webhook node:
+   *   1. Per-agent token on this node → post locally as the agent's user.
+   *   2. Explicit `agentMappings[].node` → forward to the pinned peer.
+   *   3. Mesh directory — the healthy peer that hosts both the agent and
+   *      the GitLab channel wiring (its /gitlab/* endpoints resolve the
+   *      token from the agent's own integrations[]).
+   *   4. Neither → caller falls back to the global token.
+   */
+  private resolvePostTarget(agentId?: string): { token?: string; node?: string } {
+    if (!agentId) return {}
+    const mapping = this.config.agentMappings?.find((m) => m.agentId === agentId)
+    if (mapping?.token) return { token: mapping.token }
+    if (mapping?.node) return { node: mapping.node }
+    if (this.mesh) {
+      for (const peer of this.mesh.directory()) {
+        if (!peer.healthy || !peer.channels?.includes("gitlab")) continue
+        if (peer.skills.some((s) => s.id === agentId)) return { node: peer.peer }
+      }
+    }
+    return {}
+  }
+
+  /**
+   * Find the per-agent token for the first @mentioned agent in note text.
+   */
+  private getTokenForMentionedAgent(text: string): string | undefined {
+    if (!this.config.agentMappings?.length) return undefined
+    const mentionedUsers = text.match(/@(\w[\w.-]*)/g)?.map(m => m.slice(1).replace(/[.]+$/, "").toLowerCase()) || []
+    for (const mapping of this.config.agentMappings) {
+      if (mapping.token && mapping.gitlabUsernames.some(u => mentionedUsers.includes(u.toLowerCase()))) {
+        return mapping.token
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * React to a GitLab note with an emoji to acknowledge receipt (👀) or
+   * report an outcome (❌ / ✅ / ⚠️). ONLY uses the agent's own token —
+   * never the global token (which may belong to a different agent user,
+   * causing the wrong identity to react). `name` is a gemoji shortcode.
+   */
+  private async reactToNote(project: string, noteableType: string, noteableIid: string, noteId: number, agentToken?: string, node?: string, agentId?: string, name: string = "eyes"): Promise<void> {
+    // Agent lives on a remote mesh peer — forward the reaction request there
+    if (!agentToken && node && agentId && this.reactForwarder) {
+      this.log(`Forwarding "${name}" reaction for "${agentId}" to mesh peer "${node}"`)
+      await this.reactForwarder(node, project, noteableType, noteableIid, noteId, agentId, name)
+      return
+    }
+
+    if (!agentToken) {
+      this.log(`No token for reaction on note ${noteId} (agent "${agentId}") — skipping`)
+      return
+    }
+
+    const endpoint = this.buildAwardEndpoint(project, noteableType, noteableIid, noteId)
+    if (!endpoint) return
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "PRIVATE-TOKEN": agentToken,
+        },
+        body: JSON.stringify({ name }),
+      })
+      if (!res.ok) {
+        this.log(`Reaction "${name}" failed on note ${noteId}: ${res.status}`)
+      }
+    } catch (e: any) {
+      this.log(`Failed to react to note ${noteId}: ${e.message}`)
+    }
+  }
+
+  /** Map the few unicode emoji the router sends to GitLab gemoji shortcodes.
+   *  Unknown input passes through (GitLab rejects it; the caller logs). */
+  private awardName(emoji: string): string {
+    return emoji === "👀" ? "eyes" :
+      emoji === "❌" ? "x" :
+      emoji === "✅" ? "white_check_mark" :
+      emoji === "⚠️" ? "warning" :
+      emoji
+  }
+
+  private buildAwardEndpoint(project: string, noteableType: string, noteableIid: string, noteId: number): string | undefined {
+    const encodedProject = encodeURIComponent(project)
+    if (noteableType === "issue") {
+      return `${this.config.host}/api/v4/projects/${encodedProject}/issues/${noteableIid}/notes/${noteId}/award_emoji`
+    }
+    if (noteableType === "merge_request") {
+      return `${this.config.host}/api/v4/projects/${encodedProject}/merge_requests/${noteableIid}/notes/${noteId}/award_emoji`
+    }
+    return undefined
+  }
+
+  /**
+   * Public ChannelAdapter.react — emoji acknowledgement of a note. Used by
+   * the router on transient mesh failures (❌) so the operator sees the
+   * outcome on the thread without a noisy bot comment.
+   *
+   * Identity: when the caller knows which agent the note was routed to, the
+   * reaction posts as THAT agent (its `agentMappings` token, or forwarded to
+   * the mesh peer that holds it). Only when no agent is known do we fall back
+   * to the global token. Previously every outcome emoji used the global token,
+   * so a failure on a thread that @-mentioned one bot showed up as a ❌ from
+   * whichever user owns `channels.gitlab.token` — a different bot entirely.
+   * Reporters read that as "the wrong bot is ignoring me".
+   */
+  async react(chatId: string, messageId: string, emoji: string = "👀", agentId?: string): Promise<void> {
+    // 👀 acks are posted by handleNote with the resolved agent's own token
+    // (deterministic identity). The router ALSO fires a generic 👀 through
+    // this method when it routes the task — posting that one would double-react,
+    // so drop it here.
+    if (emoji === "👀") return
+    const parts = chatId.split(":")
+    if (parts.length < 3) return
+    const iid = parts.pop()!
+    const noteableType = parts.pop()!
+    const project = parts.join(":")
+    const noteId = Number(messageId)
+    if (!noteId) return
+    // GitLab uses gemoji shortcodes for award_emoji; map the few unicodes the
+    // router actually sends. Unknown emoji → the literal unicode (GitLab will
+    // reject; logged).
+    const name = this.awardName(emoji)
+
+    // Preferred path — react as the agent that actually handled the note.
+    const target = this.resolvePostTarget(agentId)
+    if (target.token || target.node) {
+      try {
+        await this.reactToNote(project, noteableType, iid, noteId, target.token, target.node, agentId, name)
+        return
+      } catch (e: any) {
+        this.log(`React "${emoji}" as "${agentId}" failed (${e.message}) — falling back to global token`)
+      }
+    }
+
+    if (!this.config.token) return
+    const endpoint = this.buildAwardEndpoint(project, noteableType, iid, noteId)
+    if (!endpoint) return
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "PRIVATE-TOKEN": this.config.token },
+        body: JSON.stringify({ name }),
+      })
+      if (!res.ok && res.status !== 404) {
+        this.log(`React "${emoji}" on note ${noteId} failed: ${res.status}`)
+      }
+    } catch (e: any) {
+      this.log(`React "${emoji}" on note ${noteId} error: ${e.message}`)
+    }
+  }
+
+  /**
+   * Log time spent on a GitLab issue/MR after agent completes work.
+   * Uses the /add_spent_time API endpoint.
+   * chatId format: "project:type:iid" (e.g. "globex/globex-system-v2:issue:646")
+   */
+  async logTimeSpent(chatId: string, durationMs: number, agentId?: string): Promise<void> {
+    const parts = chatId.split(":")
+    if (parts.length < 3) return
+
+    const iid = parts.pop()!
+    const noteableType = parts.pop()!
+    const project = parts.join(":")
+
+    // Convert ms to GitLab duration string (minimum 1m)
+    const totalSeconds = Math.max(60, Math.round(durationMs / 1000))
+    const hours = Math.floor(totalSeconds / 3600)
+    const minutes = Math.ceil((totalSeconds % 3600) / 60)
+    const duration = hours > 0 ? `${hours}h${minutes > 0 ? ` ${minutes}m` : ""}` : `${minutes}m`
+
+    const encodedProject = encodeURIComponent(project)
+    const typeSegment = noteableType === "merge_request" ? "merge_requests" : "issues"
+    const endpoint = `${this.config.host}/api/v4/projects/${encodedProject}/${typeSegment}/${iid}/add_spent_time`
+
+    // Same identity rules as send(): for remote-hosted agents with no local
+    // per-agent token, forward the time-log to the peer so it posts as the
+    // agent's real GitLab user rather than the shared group bot.
+    const target = this.resolvePostTarget(agentId)
+    const agentToken = target.token
+    if (!agentToken && target.node && this.logTimeForwarder) {
+      try {
+        await this.logTimeForwarder(target.node, project, noteableType, iid, agentId || "", durationMs)
+        this.log(`Time logged (via peer "${target.node}"): ${duration} on ${project} ${typeSegment}/${iid} (${agentId})`)
+      } catch (e: any) {
+        this.log(`Time log forward to "${target.node}" failed: ${e.message} — skipping (would log as group bot)`)
+      }
+      return
+    }
+
+    const token = agentToken || this.config.token
+    if (!agentToken && agentId) {
+      this.log(`[gitlab/identity] time-log on ${project} ${noteableType}/${iid} from "${agentId}" using GLOBAL token (${this.botUsername || "shared bot"}) — time will be attributed to the global bot, not the agent`)
+    }
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "PRIVATE-TOKEN": token,
+        },
+        body: JSON.stringify({ duration }),
+      })
+
+      if (res.ok) {
+        this.log(`Time logged: ${duration} on ${project} ${noteableType} #${iid} (${agentId || "global"})`)
+      } else {
+        const text = await res.text()
+        this.log(`Time log failed (${res.status}): ${text.slice(0, 100)}`)
+      }
+    } catch (e: any) {
+      this.log(`Time log error: ${e.message}`)
+    }
+  }
+
+  /** Create a new GitLab issue. Mirrors `logTimeSpent`'s identity resolution:
+   *  prefers the per-agent token; if the agent is hosted on a remote peer
+   *  and no local token exists, forwards via mesh so the issue appears under
+   *  the agent's real GitLab user. Returns `{ iid, url }` or null on failure. */
+  async createIssue(args: {
+    project: string
+    title: string
+    description?: string
+    labels?: string[]
+    assignees?: string[]
+    agentId?: string
+  }): Promise<{ iid: number; url: string } | null> {
+    const { project, title, description = "", labels = [], assignees = [], agentId } = args
+    const target = this.resolvePostTarget(agentId)
+    const agentToken = target.token
+
+    // Remote-hosted agent with no local token — forward to peer.
+    if (!agentToken && target.node && this.createIssueForwarder) {
+      try {
+        const result = await this.createIssueForwarder(target.node, project, title, description, labels, assignees, agentId || "")
+        if (result) this.log(`Issue created (via peer "${target.node}") #${result.iid} on ${project}`)
+        return result
+      } catch (e: any) {
+        this.log(`Issue-create forward to "${target.node}" failed: ${e.message}`)
+        return null
+      }
+    }
+
+    const token = agentToken || this.config.token
+    if (!token) {
+      this.log(`Issue-create failed: no token available for agent "${agentId || "global"}"`)
+      return null
+    }
+    if (!agentToken && agentId) {
+      this.log(`[gitlab/identity] issue-create on ${project} from "${agentId}" using GLOBAL token (${this.botUsername || "shared bot"}) — issue will be authored by the global bot, not the agent`)
+    }
+
+    // Stamp the originating agent into the description so the audit
+    // trail survives even when the API actor is the shared bot. Same
+    // <!-- agentx:<agentId> --> marker convention used on notes.
+    const stampedDescription = agentId ? markBody(description, agentId) : description
+
+    const encodedProject = encodeURIComponent(project)
+
+    // Pre-check: dedupe on title within the last 5 minutes. The user's
+    // 2026-05-10 trace had two near-identical issues (#446 + #447) created
+    // within 15 minutes by cx-agent → devops-agent delegation cycles.
+    // Searching for an open issue with this title and returning it instead
+    // makes the create idempotent under retry/handoff loops.
+    try {
+      const searchUrl = `${this.config.host}/api/v4/projects/${encodedProject}/issues?state=opened&search=${encodeURIComponent(title)}&in=title&order_by=created_at&sort=desc&per_page=5`
+      const search = await fetch(searchUrl, { headers: { "PRIVATE-TOKEN": token } })
+      if (search.ok) {
+        const existing = await search.json() as Array<{ iid: number; title: string; web_url: string; created_at: string }>
+        const cutoff = Date.now() - 5 * 60 * 1000
+        const recent = existing.find(
+          (i) => i.title === title && Date.parse(i.created_at) > cutoff,
+        )
+        if (recent) {
+          this.log(`Issue-create deduped: "${title}" on ${project} already exists at #${recent.iid} (created ${recent.created_at}) — returning existing`)
+          return { iid: recent.iid, url: recent.web_url }
+        }
+      }
+    } catch (e: any) {
+      // Pre-check failure is non-fatal; fall through to create.
+      this.log(`Issue-create dedupe check failed (non-fatal): ${e.message}`)
+    }
+
+    const endpoint = `${this.config.host}/api/v4/projects/${encodedProject}/issues`
+    const body = new URLSearchParams()
+    body.set("title", title)
+    if (stampedDescription) body.set("description", stampedDescription)
+    if (labels.length > 0) body.set("labels", labels.join(","))
+    // GitLab takes `assignee_ids[]`; users pass usernames for ergonomics,
+    // so resolve them to numeric ids first. Failure to resolve any one
+    // assignee is logged but doesn't block the create.
+    for (const username of assignees) {
+      try {
+        const r = await fetch(`${this.config.host}/api/v4/users?username=${encodeURIComponent(username)}`, {
+          headers: { "PRIVATE-TOKEN": token },
+        })
+        if (r.ok) {
+          const users = await r.json() as Array<{ id: number }>
+          if (users[0]?.id) body.append("assignee_ids[]", String(users[0].id))
+        }
+      } catch (e: any) {
+        this.log(`Issue-create: failed to resolve assignee "${username}": ${e.message}`)
+      }
+    }
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "PRIVATE-TOKEN": token,
+        },
+        body: body.toString(),
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        this.log(`Issue-create failed (${res.status}): ${text.slice(0, 200)}`)
+        return null
+      }
+      const issue = await res.json() as { iid: number; web_url: string }
+      this.log(`Issue created #${issue.iid} on ${project} (${agentId || "global"})`)
+      return { iid: issue.iid, url: issue.web_url }
+    } catch (e: any) {
+      this.log(`Issue-create error: ${e.message}`)
+      return null
+    }
+  }
+
+  /** Add / remove labels on an existing issue or MR. Same identity
+   *  resolution as createIssue: per-agent token > mesh-forward to home > global.
+   *  Returns the updated label set on success, or null. */
+  async setLabels(args: {
+    project: string
+    kind?: "issue" | "merge_request"
+    iid: string
+    add?: string[]
+    remove?: string[]
+    agentId?: string
+  }): Promise<string[] | null> {
+    const { project, kind = "issue", iid, add = [], remove = [], agentId } = args
+    const target = this.resolvePostTarget(agentId)
+    const agentToken = target.token
+
+    if (!agentToken && target.node && this.setLabelsForwarder) {
+      try {
+        const labels = await this.setLabelsForwarder(target.node, project, kind, iid, add, remove, agentId || "")
+        if (labels) this.log(`Labels updated (via peer "${target.node}") on ${project} ${kind}/${iid}`)
+        return labels
+      } catch (e: any) {
+        this.log(`setLabels forward to "${target.node}" failed: ${e.message}`)
+        return null
+      }
+    }
+    const token = agentToken || this.config.token
+    if (!token) { this.log(`setLabels failed: no token for "${agentId || "global"}"`); return null }
+    if (!agentToken && agentId) {
+      this.log(`[gitlab/identity] setLabels on ${project} ${kind}/${iid} from "${agentId}" using GLOBAL token (${this.botUsername || "shared bot"}) — label change will appear under the global bot`)
+    }
+
+    const segment = kind === "merge_request" ? "merge_requests" : "issues"
+    const endpoint = `${this.config.host}/api/v4/projects/${encodeURIComponent(project)}/${segment}/${iid}`
+    const body = new URLSearchParams()
+    if (add.length) body.set("add_labels", add.join(","))
+    if (remove.length) body.set("remove_labels", remove.join(","))
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "PUT",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "PRIVATE-TOKEN": token },
+        body: body.toString(),
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        this.log(`setLabels failed (${res.status}): ${text.slice(0, 200)}`)
+        return null
+      }
+      const data = await res.json() as { labels?: string[] }
+      return data.labels ?? []
+    } catch (e: any) {
+      this.log(`setLabels error: ${e.message}`)
+      return null
+    }
+  }
+
+  /** Set assignees on an issue or MR. Same identity-resolution shape as
+   *  setLabels / createIssue: per-agent token → mesh-forward to home →
+   *  global fallback. Usernames are resolved to numeric user_ids before
+   *  the PUT call (GitLab's API requires assignee_ids[] integers).
+   *  Returns the resolved numeric ids on success, or null. */
+  async setAssignees(args: {
+    project: string
+    kind?: "issue" | "merge_request"
+    iid: string
+    assignees: string[]   // GitLab usernames; resolved to user_ids here
+    agentId?: string
+  }): Promise<number[] | null> {
+    const { project, kind = "issue", iid, assignees, agentId } = args
+    const mapping = this.config.agentMappings?.find((m) => m.agentId === agentId)
+    const agentToken = this.getAgentToken(agentId)
+
+    // Mesh-forward when the agent lives on a peer. We piggyback on the
+    // setLabelsForwarder shape via a separate slot below to keep the same
+    // home-as-poster discipline. For now: if no local token + remote agent,
+    // fall back to global so the call works rather than fails silently.
+    // (Adding a setAssigneesForwarder is a separate increment when the
+    // first cross-host PM-driven assignment lands.)
+    const token = agentToken || this.config.token
+    if (!token) {
+      this.log(`setAssignees failed: no token for agent "${agentId || "global"}"`)
+      return null
+    }
+    if (!agentToken && agentId) {
+      this.log(`[gitlab/identity] setAssignees on ${project} ${kind}/${iid} from "${agentId}" using GLOBAL token (${this.botUsername || "shared bot"}) — assignment will appear under the global bot`)
+    }
+
+    // Resolve usernames → numeric ids (GitLab's API quirk).
+    const ids: number[] = []
+    for (const username of assignees) {
+      try {
+        const r = await fetch(`${this.config.host}/api/v4/users?username=${encodeURIComponent(username)}`, {
+          headers: { "PRIVATE-TOKEN": token },
+        })
+        if (!r.ok) {
+          this.log(`setAssignees: lookup "${username}" returned ${r.status}`)
+          continue
+        }
+        const users = await r.json() as Array<{ id: number; username: string }>
+        const match = users.find((u) => u.username.toLowerCase() === username.toLowerCase())
+        if (match?.id) ids.push(match.id)
+        else this.log(`setAssignees: no user found for "${username}"`)
+      } catch (e: any) {
+        this.log(`setAssignees: lookup error for "${username}": ${e.message}`)
+      }
+    }
+
+    // Empty array is the canonical "unassign" call — do not bail when
+    // the caller intentionally wants to clear assignees. Only short-circuit
+    // when the caller passed names that ALL failed to resolve.
+    if (ids.length === 0 && assignees.length > 0) {
+      this.log(`setAssignees: none of [${assignees.join(", ")}] resolved on ${project}`)
+      return null
+    }
+
+    const segment = kind === "merge_request" ? "merge_requests" : "issues"
+    const endpoint = `${this.config.host}/api/v4/projects/${encodeURIComponent(project)}/${segment}/${iid}`
+    const body = new URLSearchParams()
+    for (const id of ids) body.append("assignee_ids[]", String(id))
+    if (ids.length === 0) body.append("assignee_ids[]", "0")  // GitLab convention to clear
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "PUT",
+        headers: { "Content-Type": "application/x-www-form-urlencoded", "PRIVATE-TOKEN": token },
+        body: body.toString(),
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        this.log(`setAssignees failed (${res.status}): ${text.slice(0, 200)}`)
+        return null
+      }
+      const node = mapping?.node ? `via ${mapping.node}` : (agentId || "global")
+      this.log(`Assignees updated on ${project} ${kind}/${iid} (${node}): [${assignees.join(", ")}] → ids [${ids.join(", ")}]`)
+      return ids
+    } catch (e: any) {
+      this.log(`setAssignees error: ${e.message}`)
+      return null
+    }
+  }
+
+  /** Cross-link two issues via GitLab's `/relate` API. Used by the PM
+   *  test-case-create flow: after creating the test issue, link it to the
+   *  parent dev issue so cost-per-feature accumulates correctly per the
+   *  wiki convention. Same project only — cross-project links use a
+   *  different API shape and aren't part of this fast path. */
+  async relateIssue(args: { project: string; sourceIid: string; targetIid: string; agentId?: string }): Promise<boolean> {
+    const { project, sourceIid, targetIid, agentId } = args
+    const token = this.getAgentToken(agentId) || this.config.token
+    if (!token) {
+      this.log(`relateIssue failed: no token for "${agentId || "global"}"`)
+      return false
+    }
+    const encoded = encodeURIComponent(project)
+    const endpoint = `${this.config.host}/api/v4/projects/${encoded}/issues/${sourceIid}/links?target_project_id=${encoded}&target_issue_iid=${targetIid}`
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "PRIVATE-TOKEN": token },
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        this.log(`relateIssue ${project}#${sourceIid}↔${targetIid} failed (${res.status}): ${text.slice(0, 200)}`)
+        return false
+      }
+      this.log(`Issues related on ${project}: #${sourceIid} ↔ #${targetIid} (${agentId || "global"})`)
+      return true
+    } catch (e: any) {
+      this.log(`relateIssue error: ${e.message}`)
+      return false
+    }
+  }
+
+  /** Read current labels on an issue or MR. Read-only, so doesn't need
+   *  per-agent identity. Uses the global token. */
+  async getLabels(args: { project: string; kind?: "issue" | "merge_request"; iid: string }): Promise<string[] | null> {
+    const { project, kind = "issue", iid } = args
+    if (!this.config.token) return null
+    const segment = kind === "merge_request" ? "merge_requests" : "issues"
+    const endpoint = `${this.config.host}/api/v4/projects/${encodeURIComponent(project)}/${segment}/${iid}`
+    try {
+      const res = await fetch(endpoint, { headers: { "PRIVATE-TOKEN": this.config.token } })
+      if (!res.ok) { this.log(`getLabels failed (${res.status})`); return null }
+      const data = await res.json() as { labels?: string[] }
+      return data.labels ?? []
+    } catch (e: any) {
+      this.log(`getLabels error: ${e.message}`)
+      return null
+    }
+  }
+
+  /**
+   * Extract and download images from a GitLab comment.
+   * GitLab markdown images: ![alt](/uploads/hash/filename.png)
+   * Returns the first image found as media attachment, or undefined.
+   */
+  private async downloadNoteImages(
+    note: string,
+    project: string,
+    token: string,
+  ): Promise<IncomingMessage["media"] | undefined> {
+    // Match GitLab upload paths: ![...](/uploads/...) or full URLs
+    const imagePattern = /!\[[^\]]*\]\(([^)]+\.(?:png|jpg|jpeg|gif|webp|svg))\)/gi
+    const matches = [...note.matchAll(imagePattern)]
+    if (matches.length === 0) return undefined
+
+    const imagePath = matches[0][1] // First image
+    let imageUrl: string
+
+    if (imagePath.startsWith("http")) {
+      imageUrl = imagePath
+    } else {
+      // Relative path — resolve against GitLab project
+      const encodedProject = encodeURIComponent(project)
+      imageUrl = `${this.config.host}/${project}${imagePath}`
+    }
+
+    try {
+      const res = await fetch(imageUrl, {
+        headers: { "PRIVATE-TOKEN": token },
+      })
+      if (!res.ok) {
+        this.log(`Failed to download image: ${res.status} ${imageUrl}`)
+        return undefined
+      }
+
+      const buffer = Buffer.from(await res.arrayBuffer())
+      const contentType = res.headers.get("content-type") || "image/png"
+      const ext = contentType.split("/")[1]?.split(";")[0] || "png"
+
+      // Save to disk
+      const { mkdirSync, writeFileSync } = await import("fs")
+      const { resolve } = await import("path")
+      const { randomUUID } = await import("crypto")
+      const mediaDir = resolve(process.cwd(), ".agentx/media/gitlab")
+      mkdirSync(mediaDir, { recursive: true })
+      const fileName = `${randomUUID().slice(0, 8)}.${ext}`
+      const filePath = resolve(mediaDir, fileName)
+      writeFileSync(filePath, buffer)
+
+      this.log(`Downloaded GitLab image: ${filePath} (${buffer.length} bytes)`)
+
+      return {
+        path: filePath,
+        type: contentType,
+        fileName: imagePath.split("/").pop() || fileName,
+      }
+    } catch (e: any) {
+      this.log(`Image download error: ${e.message}`)
+      return undefined
+    }
+  }
+
+  private async readBody(req: HttpRequest): Promise<Record<string, unknown>> {
+    return new Promise((resolve) => {
+      let body = ""
+      req.on("data", (chunk: Buffer) => (body += chunk.toString()))
+      req.on("end", () => {
+        try { resolve(body ? JSON.parse(body) : {}) }
+        catch { resolve({ raw: body }) }
+      })
+      req.on("error", () => resolve({}))
+    })
+  }
+}
+
+/** Extract the list of labels newly added on an `update` event. GitLab's
+ *  webhook diff is `changes.labels.{previous, current}`, each an array of
+ *  `{title, ...}` objects. We return just the lower-cased titles that
+ *  appear in current but not in previous so workflow filters can match
+ *  on `labelsAdded` regardless of GitLab's casing. */
+function extractLabelDiff(diff: unknown): string[] {
+  if (!diff || typeof diff !== "object") return []
+  const d = diff as { previous?: unknown; current?: unknown }
+  const prev = Array.isArray(d.previous)
+    ? new Set(
+        d.previous
+          .map((l: any) => (typeof l === "string" ? l : l?.title))
+          .filter((s: any): s is string => typeof s === "string")
+          .map((s: string) => s.toLowerCase()),
+      )
+    : new Set<string>()
+  const cur = Array.isArray(d.current)
+    ? d.current
+        .map((l: any) => (typeof l === "string" ? l : l?.title))
+        .filter((s: any): s is string => typeof s === "string")
+        .map((s: string) => s.toLowerCase())
+    : []
+  return cur.filter((s) => !prev.has(s))
+}

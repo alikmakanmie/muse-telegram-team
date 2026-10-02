@@ -1,0 +1,649 @@
+import {
+  readFileSync,
+  writeFileSync,
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  statSync,
+} from "fs"
+import { resolve, dirname } from "path"
+import { createHash } from "crypto"
+import {
+  graphSchemaSchema,
+  nodesFileSchema,
+  indexFileSchema,
+  fingerprintEntrySchema,
+  classificationSchema,
+  type GraphSchema,
+  type GraphNode,
+  type NodesFile,
+  type IndexFile,
+  type Classification,
+  type FingerprintEntry,
+} from "./types"
+import { STARTER_SCHEMA, STARTER_VERB_NODES } from "./starter-schema"
+
+// --- Intent Knowledge Graph filesystem store ---
+//
+// Mirrors the .agentx/wiki pattern: plain JSON on disk, one directory, no DB.
+// Not thread-safe across processes — writes go through safeWrite (tmp + rename).
+
+export interface GraphStoreOptions {
+  baseDir?: string
+  log?: (...args: unknown[]) => void
+}
+
+export class GraphStore {
+  readonly baseDir: string
+  private log: (...args: unknown[]) => void
+  /** Parsed nodes/index files, keyed by path. The classifier reads both
+   *  several times per message and they grow without bound, so re-reading
+   *  and re-validating them each time blocked the daemon for seconds. */
+  private parsed = new Map<string, { mtimeMs: number; size: number; data: unknown }>()
+
+  constructor(opts: GraphStoreOptions = {}) {
+    this.baseDir = opts.baseDir ?? resolve(process.cwd(), ".agentx/graph")
+    this.log = opts.log ?? console.error.bind(console, "[graph]")
+    mkdirSync(this.baseDir, { recursive: true })
+  }
+
+  // --- Paths ---
+
+  schemaPath(): string { return resolve(this.baseDir, "schema.json") }
+  nodesPath(): string { return resolve(this.baseDir, "nodes.json") }
+  indexPath(): string { return resolve(this.baseDir, "index.json") }
+  classificationsPath(): string { return resolve(this.baseDir, "classifications.jsonl") }
+
+  // --- Schema ---
+
+  /** Load the graph schema, seeding STARTER_SCHEMA if the file is missing.
+   *  Phase 1 of the classifier-retire plan ships a v2 verb-level schema;
+   *  installs with the v1 hierarchical schema (scope > org > unit >
+   *  activity) get auto-migrated on next load: the v1 file is renamed
+   *  to schema.v1.bak.json, the v2 starter is written, and the
+   *  per-event nodes.json + classifications.jsonl are left alone for
+   *  historical reading. New events classify under v2 from then on. */
+  loadSchema(): GraphSchema {
+    const p = this.schemaPath()
+    if (!existsSync(p)) {
+      this.saveSchema(STARTER_SCHEMA)
+      this.log("seeded starter schema at", p)
+      return STARTER_SCHEMA
+    }
+    const raw = readFileSync(p, "utf-8")
+    const parsed = graphSchemaSchema.safeParse(JSON.parse(raw))
+    if (!parsed.success) {
+      throw new Error(`Invalid ${p}: ${parsed.error.issues.map((i) => i.message).join("; ")}`)
+    }
+    if ((parsed.data.version ?? 1) < (STARTER_SCHEMA.version ?? 2)) {
+      const backup = p.replace(/\.json$/, `.v${parsed.data.version ?? 1}.bak.json`)
+      try {
+        writeFileSync(backup, raw)
+        this.log(`migrated graph schema v${parsed.data.version ?? 1} -> v${STARTER_SCHEMA.version}; old saved at ${backup}`)
+      } catch (e: any) {
+        this.log(`could not back up old schema: ${e?.message ?? e}`)
+      }
+      this.saveSchema(STARTER_SCHEMA)
+      // Same treatment for nodes.json — the v1 nodes were parented under
+      // levels that don't exist in v2 and would fail validation. Archive
+      // them and re-seed.
+      const np = this.nodesPath()
+      if (existsSync(np)) {
+        const nbackup = np.replace(/\.json$/, `.v1.bak.json`)
+        try {
+          writeFileSync(nbackup, readFileSync(np, "utf-8"))
+          this.log(`archived v1 nodes.json -> ${nbackup}`)
+        } catch (e: any) {
+          this.log(`could not back up old nodes: ${e?.message ?? e}`)
+        }
+        try {
+          const seeded = seedNodesFile()
+          this.saveNodes(seeded)
+        } catch (e: any) {
+          this.log(`could not seed v2 nodes: ${e?.message ?? e}`)
+        }
+      }
+      return STARTER_SCHEMA
+    }
+    return parsed.data
+  }
+
+  saveSchema(schema: GraphSchema): void {
+    const parsed = graphSchemaSchema.safeParse(schema)
+    if (!parsed.success) {
+      throw new Error(`Refusing to save invalid schema: ${parsed.error.issues.map((i) => i.message).join("; ")}`)
+    }
+    safeWriteJson(this.schemaPath(), parsed.data)
+  }
+
+  // --- Nodes ---
+
+  loadNodes(): NodesFile {
+    const p = this.nodesPath()
+    if (!existsSync(p)) {
+      // Seed the verb-level taxonomy on first load. Lets the classifier
+      // pick from a stable set of common verbs out of the box, instead of
+      // inventing slightly-different variants for every event.
+      const seeded = seedNodesFile()
+      this.saveNodes(seeded)
+      return seeded
+    }
+    // A copy, so callers can edit it before saveNodes without touching the cache.
+    return structuredClone(this.readParsed(p, (raw) => {
+      const parsed = nodesFileSchema.safeParse(JSON.parse(raw))
+      if (!parsed.success) {
+        throw new Error(`Invalid ${p}: ${parsed.error.issues.map((i) => i.message).join("; ")}`)
+      }
+      return parsed.data
+    }))
+  }
+
+  saveNodes(file: NodesFile): void {
+    const parsed = nodesFileSchema.safeParse(file)
+    if (!parsed.success) {
+      throw new Error(`Refusing to save invalid nodes file: ${parsed.error.issues.map((i) => i.message).join("; ")}`)
+    }
+    this.writeParsed(this.nodesPath(), parsed.data)
+  }
+
+  /** The parsed file, re-read only when its mtime or size changes, so a
+   *  write from another process (CLI, dashboard) is still picked up. */
+  private readParsed<T>(p: string, parse: (raw: string) => T): T {
+    const { mtimeMs, size } = statSync(p)
+    const hit = this.parsed.get(p)
+    if (hit && hit.mtimeMs === mtimeMs && hit.size === size) return hit.data as T
+    const data = parse(readFileSync(p, "utf-8"))
+    this.parsed.set(p, { mtimeMs, size, data })
+    return data
+  }
+
+  /** Write the file and keep the parsed copy, so the writer never re-reads
+   *  what it just wrote. `data` must not be mutated afterwards. */
+  private writeParsed(p: string, data: unknown): void {
+    this.parsed.delete(p)
+    safeWriteJson(p, data)
+    const { mtimeMs, size } = statSync(p)
+    this.parsed.set(p, { mtimeMs, size, data })
+  }
+
+  /** Validate a node against the schema AND uniqueness within the nodes file. */
+  validateNode(node: GraphNode, schema: GraphSchema, all: GraphNode[]): void {
+    const level = schema.levels.find((l) => l.id === node.level)
+    if (!level) throw new Error(`Unknown level: "${node.level}"`)
+
+    const missing = level.axes
+      .filter((a) => !a.optional)
+      .filter((a) => !(a.name in node.axes))
+    if (missing.length) {
+      throw new Error(
+        `Node ${node.id} (${node.level}) missing required axes: ${missing.map((a) => a.name).join(", ")}`,
+      )
+    }
+
+    for (const a of level.axes) {
+      const v = node.axes[a.name]
+      if (v == null) continue
+      if (a.type === "enum" && a.values && !a.values.includes(v)) {
+        throw new Error(`Node ${node.id}: axis ${a.name}="${v}" not in enum ${JSON.stringify(a.values)}`)
+      }
+      if (a.type === "ref") {
+        if (!all.some((n) => n.id === v)) {
+          throw new Error(`Node ${node.id}: axis ${a.name}="${v}" refers to unknown node`)
+        }
+        if (a.refLevel) {
+          const target = all.find((n) => n.id === v)!
+          if (target.level !== a.refLevel) {
+            throw new Error(
+              `Node ${node.id}: axis ${a.name} expected level "${a.refLevel}" but got "${target.level}"`,
+            )
+          }
+        }
+      }
+    }
+
+    const levelIdx = schema.levels.findIndex((l) => l.id === node.level)
+    if (levelIdx === 0) {
+      if (node.parentId !== null) {
+        throw new Error(`Root-level node ${node.id} must have parentId: null`)
+      }
+    } else {
+      if (!node.parentId) {
+        throw new Error(`Non-root node ${node.id} must have a parentId`)
+      }
+      const parent = all.find((n) => n.id === node.parentId)
+      if (!parent) throw new Error(`Node ${node.id}: parent "${node.parentId}" not found`)
+      const parentLevelIdx = schema.levels.findIndex((l) => l.id === parent.level)
+      // Parent may be at any higher level — intermediate levels can be skipped
+      // for orgs that don't use them (e.g. remote-first: no location node).
+      if (parentLevelIdx < 0 || parentLevelIdx >= levelIdx) {
+        throw new Error(
+          `Node ${node.id} at level "${node.level}" has parent at level "${parent.level}" — parent must be at a higher level`,
+        )
+      }
+    }
+  }
+
+  /**
+   * Commit a full classification path: for each path element that doesn't
+   * yet exist, infer its schema level by matching the proposed axes against
+   * the level's required axes (first match ≥ cursor wins — this handles
+   * paths that skip levels, like business → acme where location is
+   * absent). Refreshes the node list between adds so callers in a loop
+   * don't hit "Node id already exists" on the second iteration.
+   */
+  commitNodesAlongPath(
+    path: string[],
+    proposedAxes: Record<string, Record<string, string>>,
+    schema: GraphSchema,
+    createdBy?: string,
+  ): { added: GraphNode[]; skipped: string[] } {
+    const added: GraphNode[] = []
+    const skipped: string[] = []
+    const now = new Date().toISOString()
+
+    for (let i = 0; i < path.length; i++) {
+      const id = path[i]
+      // Load fresh each iteration — cheap O(N) file read, avoids stale snapshots.
+      const current = this.loadNodes().nodes
+      const existing = current.find((n) => n.id === id)
+      if (existing) {
+        skipped.push(id)
+        continue
+      }
+
+      // Cursor: how deep the schema-levels we've already filled up to.
+      let cursor = 0
+      // Scan backwards through path[0..i-1] to find the deepest already-committed
+      // or just-added node and resume after its level.
+      for (let j = i - 1; j >= 0; j--) {
+        const priorId = path[j]
+        const priorNode = current.find((n) => n.id === priorId) || added.find((n) => n.id === priorId)
+        if (priorNode) {
+          cursor = schema.levels.findIndex((l) => l.id === priorNode.level) + 1
+          break
+        }
+      }
+
+      const axes = proposedAxes[id] ?? {}
+      // Find the first level at or after the cursor whose required axes are
+      // satisfied by proposedAxes[id]. "Required" here = listed in level.axes;
+      // we accept a partial match (axes present in proposal, even if some
+      // schema axes are missing — validateNode will catch truly broken ones).
+      let chosenLevel: string | null = null
+      for (let j = cursor; j < schema.levels.length; j++) {
+        const level = schema.levels[j]
+        const missing = level.axes
+          .filter((a) => !a.optional)
+          .filter((a) => !(a.name in axes))
+        if (missing.length === 0) {
+          chosenLevel = level.id
+          cursor = j + 1
+          break
+        }
+      }
+      // Fallback: if no level's axes fully match, try the NEXT level after
+      // the cursor anyway. Better to commit at the likely level and let
+      // validateNode reject on write than to silently drop the whole path.
+      if (!chosenLevel && cursor < schema.levels.length) {
+        chosenLevel = schema.levels[cursor].id
+        cursor++
+      }
+      if (!chosenLevel) {
+        throw new Error(`Can't place node ${id} — no schema level left (cursor=${cursor}, levels=${schema.levels.length})`)
+      }
+
+      // Parent is the DEEPEST already-placed node at a level < chosenLevel.
+      let parentId: string | null = null
+      const chosenIdx = schema.levels.findIndex((l) => l.id === chosenLevel)
+      for (let j = i - 1; j >= 0; j--) {
+        const priorId = path[j]
+        const prior = current.find((n) => n.id === priorId) || added.find((n) => n.id === priorId)
+        if (!prior) continue
+        const priorIdx = schema.levels.findIndex((l) => l.id === prior.level)
+        if (priorIdx >= 0 && priorIdx < chosenIdx) { parentId = priorId; break }
+      }
+
+      const node: GraphNode = {
+        id, level: chosenLevel, parentId, axes,
+        createdAt: now,
+        createdBy,
+      }
+      this.addNode(node)  // throws if schema validation fails
+      added.push(node)
+    }
+
+    return { added, skipped }
+  }
+
+  /** Append a node. Caller is responsible for id uniqueness; we check and throw. */
+  addNode(node: GraphNode): GraphNode {
+    const schema = this.loadSchema()
+    const file = this.loadNodes()
+    if (file.nodes.some((n) => n.id === node.id)) {
+      throw new Error(`Node id already exists: ${node.id}`)
+    }
+    this.validateNode(node, schema, [...file.nodes, node])
+    file.nodes.push(node)
+    this.saveNodes(file)
+    return node
+  }
+
+  // --- Classifications (append-only log) ---
+
+  appendClassification(c: Classification): boolean {
+    const parsed = classificationSchema.safeParse(c)
+    if (!parsed.success) {
+      // Before the fix this threw and took down the whole task. Now we drop
+      // the bad classification and log enough detail (the offending path +
+      // axes keys) for the operator to diagnose the prompt. Returning false
+      // lets callers decide whether to retry with a cleaner proposal.
+      const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(" · ")
+      this.log(
+        `skipped invalid classification — ${issues} ·`,
+        `path=${JSON.stringify(c.path)}`,
+        `axes-keys=${JSON.stringify(Object.keys(c.proposedAxes || {}))}`,
+      )
+      return false
+    }
+    const line = JSON.stringify(parsed.data) + "\n"
+    const p = this.classificationsPath()
+    if (!existsSync(p)) {
+      mkdirSync(dirname(p), { recursive: true })
+    }
+    appendFileSync(p, line)
+    return true
+  }
+
+  /**
+   * All pending classifications, newest first. Collapses the append-only
+   * ledger by msgHash — the most recent entry per message wins (so if an
+   * entry was updated via updateClassificationStatus, we see the current
+   * state, not the original).
+   */
+  listPendingClassifications(limit = 200): Classification[] {
+    return this.listByStatus("pending", limit)
+  }
+
+  /** Every classification, newest-first, collapsed one row per message.
+   *  The human-label queue needs the whole population rather than one
+   *  status, because the rows worth checking are the auto-approved ones. */
+  listAllClassifications(): Classification[] {
+    return this.readAllCollapsed()
+  }
+
+  /** Same contract as listPendingClassifications but filtered to any status. */
+  listByStatus(status: Classification["status"], limit = 200): Classification[] {
+    const all = this.readAllCollapsed()
+    return all.filter((c) => c.status === status).slice(0, limit)
+  }
+
+  /**
+   * Read every classification, collapse by msgHash keeping the newest entry
+   * per message. Used by listByStatus + the review loop to see current state.
+   * Returns newest-first order.
+   */
+  private readAllCollapsed(): Classification[] {
+    const p = this.classificationsPath()
+    if (!existsSync(p)) return []
+    const raw = readFileSync(p, "utf-8")
+    const lines = raw.split("\n").filter(Boolean)
+    const byHash = new Map<string, Classification>()
+    for (const line of lines) {
+      try {
+        const parsed = classificationSchema.safeParse(JSON.parse(line))
+        if (!parsed.success) continue
+        // Later entries overwrite earlier ones for the same msgHash.
+        byHash.set(parsed.data.msgHash, parsed.data)
+      } catch {
+        // skip malformed
+      }
+    }
+    // Newest-first — sort by ts desc.
+    return Array.from(byHash.values()).sort((a, b) => (a.ts < b.ts ? 1 : -1))
+  }
+
+  /**
+   * Append a status-update entry for an existing classification. The ledger
+   * stays append-only; readers collapse by msgHash. Returns the updated
+   * classification, or null if no prior entry for msgHash exists.
+   */
+  updateClassificationStatus(
+    msgHash: string,
+    update: {
+      status: Classification["status"]
+      reviewer?: string
+      reviewReason?: string
+    },
+  ): Classification | null {
+    const all = this.readAllCollapsed()
+    const prior = all.find((c) => c.msgHash === msgHash)
+    if (!prior) return null
+    const next: Classification = {
+      ...prior,
+      status: update.status,
+      ts: new Date().toISOString(),
+    }
+    // Store reviewer + reason in the preview field so readers can see who
+    // flipped what without needing a separate review-log file. Non-breaking:
+    // preview is already optional text meant for UI display.
+    if (update.reviewer || update.reviewReason) {
+      const suffix = ` · ${update.reviewer ? `reviewer=${update.reviewer}` : ""}${update.reviewReason ? ` · ${update.reviewReason}` : ""}`
+      next.preview = ((prior.preview || "") + suffix).slice(0, 500)
+    }
+    this.appendClassification(next)
+    return next
+  }
+
+  /** Read the last N classifications, newest first. Cheap enough for the admin UI. */
+  readRecentClassifications(limit = 50): Classification[] {
+    const p = this.classificationsPath()
+    if (!existsSync(p)) return []
+    const raw = readFileSync(p, "utf-8")
+    const lines = raw.split("\n").filter(Boolean)
+    const out: Classification[] = []
+    for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+      try {
+        const parsed = classificationSchema.safeParse(JSON.parse(lines[i]))
+        if (parsed.success) out.push(parsed.data)
+      } catch {
+        // skip malformed line — append-only log; don't fail reads on one bad line
+      }
+    }
+    return out
+  }
+
+  // --- Fingerprint index ---
+
+  /**
+   * Hash that represents "this kind of message" for snap-to-path caching.
+   *
+   * Keyed on the normalized wording plus the channel. The sender used to be
+   * part of the key too, and the exact text was: measured over the last
+   * 2,000 classifications, 89% missed, so nearly every task paid an LLM
+   * call for a taxonomy label. Identifiers, numbers, links and mentions
+   * are what differ between two messages that mean the same thing, so
+   * they are folded away (see `normalizeForFingerprint`).
+   */
+  fingerprint(msg: {
+    text: string
+    channel?: string
+    sender?: string
+  }): string {
+    const norm = normalizeForFingerprint(msg.text)
+    const payload = [norm, msg.channel ?? ""].join("\u0001")
+    return createHash("sha256").update(payload).digest("hex").slice(0, 32)
+  }
+
+  loadIndex(): IndexFile {
+    return structuredClone(this.index())
+  }
+
+  saveIndex(file: IndexFile): void {
+    const parsed = indexFileSchema.safeParse(file)
+    if (!parsed.success) {
+      throw new Error(`Refusing to save invalid index: ${parsed.error.issues.map((i) => i.message).join("; ")}`)
+    }
+    this.writeParsed(this.indexPath(), parsed.data)
+  }
+
+  /** The cached index. Read-only: copy before handing it to a caller. */
+  private index(): IndexFile {
+    const p = this.indexPath()
+    if (!existsSync(p)) return { version: 1, entries: {} }
+    return this.readParsed(p, (raw) => {
+      const parsed = indexFileSchema.safeParse(JSON.parse(raw))
+      if (!parsed.success) {
+        throw new Error(`Invalid ${p}: ${parsed.error.issues.map((i) => i.message).join("; ")}`)
+      }
+      return parsed.data
+    })
+  }
+
+  getFingerprint(fp: string): FingerprintEntry | undefined {
+    const entry = this.index().entries[fp]
+    return entry && structuredClone(entry)
+  }
+
+  setFingerprint(fp: string, entry: Omit<FingerprintEntry, "fingerprint" | "updatedAt">): void {
+    // Validate only the new entry: the rest of the index was validated when
+    // it was read, and re-checking thousands of entries per message is the
+    // cost this cache exists to avoid.
+    const parsed = fingerprintEntrySchema.safeParse({
+      ...entry,
+      fingerprint: fp,
+      updatedAt: new Date().toISOString(),
+    })
+    if (!parsed.success) {
+      throw new Error(`Refusing to save invalid index entry: ${parsed.error.issues.map((i) => i.message).join("; ")}`)
+    }
+    const current = this.index()
+    this.writeParsed(this.indexPath(), { ...current, entries: { ...current.entries, [fp]: parsed.data } })
+  }
+
+  /** Update the axes on an existing node. Schema-validates the result. */
+  updateNodeAxes(id: string, axes: Record<string, string>): GraphNode {
+    const schema = this.loadSchema()
+    const file = this.loadNodes()
+    const node = file.nodes.find((n) => n.id === id)
+    if (!node) throw new Error(`Node not found: ${id}`)
+    const updated: GraphNode = { ...node, axes }
+    this.validateNode(updated, schema, file.nodes.map((n) => (n.id === id ? updated : n)))
+    file.nodes = file.nodes.map((n) => (n.id === id ? updated : n))
+    this.saveNodes(file)
+    return updated
+  }
+
+  /** Remove a node. Refuses to delete if any other node still references it
+   *  (child via parentId, or axis ref). */
+  deleteNode(id: string): void {
+    const file = this.loadNodes()
+    const child = file.nodes.find((n) => n.parentId === id)
+    if (child) {
+      throw new Error(`Cannot delete "${id}" — child node "${child.id}" still points to it`)
+    }
+    const refHolder = file.nodes.find((n) =>
+      Object.values(n.axes).some((v) => v === id),
+    )
+    if (refHolder) {
+      throw new Error(`Cannot delete "${id}" — node "${refHolder.id}" references it via an axis`)
+    }
+    file.nodes = file.nodes.filter((n) => n.id !== id)
+    this.saveNodes(file)
+  }
+
+  /** Approve a pending classification. Commits any new nodes along its path,
+   *  stamps the fingerprint index so future similar messages hit the cache,
+   *  and appends an audit entry. Idempotent — no-op if already cached. */
+  approveClassification(c: Classification): void {
+    if (this.getFingerprint(c.msgHash)) return // already approved
+    // Commit any path nodes the LLM proposed but hadn't been confirmed yet.
+    const schema = this.loadSchema()
+    const known = new Set(this.loadNodes().nodes.map((n) => n.id))
+    for (let i = 0; i < c.path.length; i++) {
+      const id = c.path[i]
+      if (known.has(id)) continue
+      const level = schema.levels[i]?.id
+      if (!level) break
+      const axes = c.proposedAxes?.[id] ?? {}
+      const parentId = i === 0 ? null : c.path[i - 1]
+      this.addNode({
+        id,
+        level,
+        parentId,
+        axes,
+        createdAt: new Date().toISOString(),
+        createdBy: c.agentId,
+      })
+      known.add(id)
+    }
+    this.setFingerprint(c.msgHash, { path: c.path, leaf: c.leaf })
+    this.appendClassification({ ...c, status: "approved", ts: new Date().toISOString() })
+  }
+
+  /** Record rejection — no nodes committed, no fingerprint set. */
+  rejectClassification(c: Classification): void {
+    this.appendClassification({ ...c, status: "rejected", ts: new Date().toISOString() })
+  }
+}
+
+/** Atomic write: tmp file + rename. Avoids half-written JSON on crashes. */
+function safeWriteJson(path: string, data: unknown): void {
+  mkdirSync(dirname(path), { recursive: true })
+  const tmp = `${path}.tmp-${process.pid}`
+  writeFileSync(tmp, JSON.stringify(data, null, 2))
+  renameSync(tmp, path)
+}
+
+/** Build the seed nodes.json — one category node per enum value, plus
+ *  one verb node per STARTER_VERB_NODES entry parented under its
+ *  category. Idempotent shape: same input always produces the same
+ *  file, so re-seeding is safe. */
+function seedNodesFile(): NodesFile {
+  const now = new Date().toISOString()
+  const nodes: NodesFile["nodes"] = []
+  const seenCats = new Set<string>()
+  for (const v of STARTER_VERB_NODES) {
+    if (!seenCats.has(v.category)) {
+      nodes.push({
+        id: v.category,
+        level: "category",
+        parentId: null,
+        axes: { kind: v.category },
+        createdAt: now,
+        createdBy: "starter",
+      })
+      seenCats.add(v.category)
+    }
+  }
+  for (const v of STARTER_VERB_NODES) {
+    nodes.push({
+      id: v.verb,
+      level: "verb",
+      parentId: v.category,
+      axes: { name: v.verb, ...(v.description ? { description: v.description } : {}) },
+      createdAt: now,
+      createdBy: "starter",
+    })
+  }
+  return { version: 1, nodes }
+}
+
+/**
+ * Fold a message down to the words that carry its intent. Links, mentions,
+ * issue or MR references, hashes and numbers vary between two requests of
+ * the same kind, so they collapse to placeholders; punctuation and case go.
+ * Long webhook bodies are cut so a note on the same thread hashes alike.
+ */
+export function normalizeForFingerprint(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " url ")
+    .replace(/[@#][\w.\/-]+/g, " ref ")
+    .replace(/\b[0-9a-f]{7,}\b/g, " id ")
+    .replace(/\d+/g, " num ")
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400)
+}

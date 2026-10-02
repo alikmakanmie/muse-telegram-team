@@ -1,0 +1,19 @@
+[Unit]
+Description=Muse Bridge for 9Router (127.0.0.1:8765)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/USER
+Environment=BRIDGE_QUEUE=/home/USER/workspace/muse-bridge/queue
+Environment=BRIDGE_LEASE_SECS=300
+WorkingDirectory=/home/USER/workspace/muse-bridge
+ExecStart=/usr/bin/python3 /home/USER/workspace/muse-bridge/bridge.py serve
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

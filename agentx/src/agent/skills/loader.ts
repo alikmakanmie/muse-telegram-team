@@ -1,0 +1,237 @@
+import { existsSync, promises as fs } from "fs"
+import path from "path"
+import fg from "fast-glob"
+import yaml from "js-yaml"
+import { logger } from "@/utils/logger"
+import type { Skill, SkillFrontmatter, SkillMatch } from "./types"
+import { skillFrontmatterSchema } from "./types"
+
+// --- Load skills from local files and remote packages ---
+
+const SKILL_DIRS = [".skills", ".claude/skills", "skills"]
+const SKILL_FILE = "SKILL.md"
+
+/** Skills change when someone edits a workspace, not between two turns
+ *  of the same task. A short cache spares every turn a recursive glob
+ *  plus a YAML parse per skill; the loader saw 90s outliers under load. */
+const SKILL_CACHE_TTL_MS = 60_000
+const skillCache = new Map<string, { at: number; skills: Skill[] }>()
+
+/** Drop cached skill lists (tests, `agentx teach`, workspace rewrites). */
+export function clearSkillCache(cwd?: string): void {
+  if (cwd) skillCache.delete(path.resolve(cwd))
+  else skillCache.clear()
+}
+
+export async function loadLocalSkills(cwd: string): Promise<Skill[]> {
+  const cacheKey = path.resolve(cwd)
+  const hit = skillCache.get(cacheKey)
+  if (hit && Date.now() - hit.at < SKILL_CACHE_TTL_MS) return hit.skills.slice()
+  const skills = await scanLocalSkills(cwd)
+  skillCache.set(cacheKey, { at: Date.now(), skills })
+  return skills.slice()
+}
+
+async function scanLocalSkills(cwd: string): Promise<Skill[]> {
+  const skills: Skill[] = []
+
+  for (const dir of SKILL_DIRS) {
+    const skillDir = path.resolve(cwd, dir)
+    if (!existsSync(skillDir)) continue
+
+    const skillFiles = await fg.glob(`**/${SKILL_FILE}`, {
+      cwd: skillDir,
+      deep: 3,
+      caseSensitiveMatch: false,
+    })
+
+    for (const file of skillFiles) {
+      const fullPath = path.resolve(skillDir, file)
+      const skill = await parseSkillFile(fullPath)
+      if (skill) {
+        skill.source = "local"
+        skill.path = fullPath
+        skills.push(skill)
+      }
+    }
+  }
+
+  // Also check for a single SKILL.md at project root
+  const rootSkill = path.resolve(cwd, SKILL_FILE)
+  if (existsSync(rootSkill)) {
+    const skill = await parseSkillFile(rootSkill)
+    if (skill) {
+      skill.source = "local"
+      skill.path = rootSkill
+      skills.push(skill)
+    }
+  }
+
+  return skills
+}
+
+export async function parseSkillFile(filePath: string): Promise<Skill | null> {
+  try {
+    const content = await fs.readFile(filePath, "utf8")
+    return parseSkillContent(content)
+  } catch {
+    return null
+  }
+}
+
+export function parseSkillContent(content: string): Skill | null {
+  try {
+    // Parse YAML frontmatter
+    const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/)
+
+    if (!frontmatterMatch) {
+      // No frontmatter - treat entire content as instructions with minimal metadata
+      return {
+        frontmatter: { name: "unnamed", description: "No description" },
+        instructions: content.trim(),
+        source: "local",
+      }
+    }
+
+    const [, frontmatterRaw, instructions] = frontmatterMatch
+    const frontmatter = parseYamlFrontmatter(frontmatterRaw)
+
+    const validated = skillFrontmatterSchema.parse(frontmatter)
+
+    return {
+      frontmatter: validated,
+      instructions: instructions.trim(),
+      source: "local",
+    }
+  } catch {
+    return null
+  }
+}
+
+function parseYamlFrontmatter(raw: string): Record<string, unknown> {
+  // Real YAML — handles arrays (block + flow), nested objects (e.g. `metadata:`
+  // sub-block used by some skills), quoted strings, and comma-separated tag
+  // strings. The previous primitive parser silently dropped nested keys, which
+  // caused valid skills (initech-pm, hotmail, initech-v1-coder) to fail Zod validation
+  // and load as null.
+  const parsed = yaml.load(raw)
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {}
+  }
+  const result = parsed as Record<string, unknown>
+  // Some skills nest tags under `metadata.tags` as a comma-separated string.
+  // Lift it to the top-level shape Zod expects (array of strings) so the
+  // schema accepts the skill.
+  const meta = result.metadata as Record<string, unknown> | undefined
+  if (meta && typeof meta === "object") {
+    if (!result.tags && meta.tags) {
+      if (typeof meta.tags === "string") {
+        result.tags = meta.tags.split(",").map(t => t.trim()).filter(Boolean)
+      } else if (Array.isArray(meta.tags)) {
+        result.tags = meta.tags
+      }
+    }
+    if (!result.version && meta.version) result.version = meta.version
+  }
+  return result
+}
+
+export function matchSkillsToTask(
+  skills: Skill[],
+  taskDescription: string,
+  outputType?: string
+): SkillMatch[] {
+  const matches: SkillMatch[] = []
+  const taskLower = taskDescription.toLowerCase()
+  const taskWords = new Set(taskLower.split(/\s+/))
+
+  for (const skill of skills) {
+    let relevance = 0
+    let matchReason = ""
+
+    // Check trigger patterns
+    if (skill.frontmatter.triggers) {
+      for (const trigger of skill.frontmatter.triggers) {
+        try {
+          const regex = new RegExp(trigger.pattern, "i")
+          if (regex.test(taskDescription)) {
+            relevance = Math.max(relevance, 0.9)
+            matchReason = `Trigger match: ${trigger.description || trigger.pattern}`
+          }
+        } catch {
+          // Invalid regex - try simple string match
+          if (taskLower.includes(trigger.pattern.toLowerCase())) {
+            relevance = Math.max(relevance, 0.7)
+            matchReason = `Keyword match: ${trigger.pattern}`
+          }
+        }
+      }
+    }
+
+    // Check tags overlap
+    if (skill.frontmatter.tags) {
+      const tagOverlap = skill.frontmatter.tags.filter(
+        (tag) => taskWords.has(tag.toLowerCase()) || taskLower.includes(tag.toLowerCase())
+      )
+      if (tagOverlap.length) {
+        const tagRelevance = Math.min(tagOverlap.length * 0.3, 0.8)
+        if (tagRelevance > relevance) {
+          relevance = tagRelevance
+          matchReason = `Tag match: ${tagOverlap.join(", ")}`
+        }
+      }
+    }
+
+    // Check name/description overlap
+    const nameWords = skill.frontmatter.name.toLowerCase().split(/[-_\s]+/)
+    const descWords = skill.frontmatter.description.toLowerCase().split(/\s+/)
+    const allSkillWords = new Set([...nameWords, ...descWords])
+
+    const overlap = [...taskWords].filter((w) => allSkillWords.has(w) && w.length > 3)
+    if (overlap.length > 0) {
+      const wordRelevance = Math.min(overlap.length * 0.2, 0.6)
+      if (wordRelevance > relevance) {
+        relevance = wordRelevance
+        matchReason = `Content match: ${overlap.join(", ")}`
+      }
+    }
+
+    if (relevance > 0.1) {
+      matches.push({ skill, relevance, matchReason })
+    }
+  }
+
+  return matches.sort((a, b) => b.relevance - a.relevance)
+}
+
+/**
+ * Find auto-injectable skills that match the current message.
+ * Only skills with `autoInject: true` in frontmatter participate.
+ * Returns skill content to inject into context, capped at maxTokens.
+ */
+export function getAutoInjectSkills(
+  skills: Skill[],
+  message: string,
+  maxTokens: number = 2000,
+): string {
+  const autoSkills = skills.filter(s => s.frontmatter.autoInject)
+  if (autoSkills.length === 0) return ""
+
+  const matches = matchSkillsToTask(autoSkills, message)
+  if (matches.length === 0) return ""
+
+  // Inject matched skills within token budget
+  const maxChars = maxTokens * 4
+  const sections: string[] = ["[Auto-Injected Skills — matched to current task]"]
+  let totalChars = sections[0].length
+
+  for (const match of matches) {
+    const content = `\n## ${match.skill.frontmatter.name} (${Math.round(match.relevance * 100)}% match)\n${match.skill.instructions}`
+    if (totalChars + content.length > maxChars) break
+    sections.push(content)
+    totalChars += content.length
+  }
+
+  if (sections.length === 1) return "" // no skills fit in budget
+  return sections.join("\n")
+}

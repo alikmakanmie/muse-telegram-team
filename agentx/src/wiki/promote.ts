@@ -1,0 +1,791 @@
+import { createHash } from "crypto"
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "fs"
+import { resolve } from "path"
+import { AgentMemory, type MemoryRecord, type MemoryType } from "../agents/agent-memory"
+import { WikiStore } from "./store"
+import { buildMemoryPromotePrompt } from "./prompts"
+import { isWikiArticleType, type WikiIndex } from "./types"
+import { newProposalId, readProposal, saveProposal, type PromotionProposal, type ProposalSource } from "./proposals"
+
+// --- Memory → wiki promotion ---
+//
+// Finishes the architecture documented in agent-memory.ts: memory is
+// experiential / per-agent; the wiki is authoritative / cross-agent. This
+// module reads per-agent memories, decides (via an LLM judge) which are
+// durable and fleet-relevant, and PROPOSES them as [[wikilinked]] articles
+// for the SHARED wiki store. Nothing reaches the wiki until an operator
+// approves the proposal (proposals.ts): a wrong or planted lesson would
+// otherwise reach every agent overnight.
+//
+// Idempotency has two layers, both keyed on the versioned stamp
+// `memory:<agentId>/<type>_<name>@<updatedAt>`:
+//
+//   1. Promoted memories: the stamp is recorded in the target article's
+//      `sources[]` frontmatter (same pattern as getUnabsorbedEntries).
+//   2. Skipped memories: recorded in `.agentx/wiki/_memory-promotions.json`
+//      so permanently-irrelevant memories aren't re-judged every night.
+//
+// A bumped `updatedAt` beats both — an edited memory re-enters the
+// pipeline, and mergeSources() replaces the stale stamp for its key so
+// frontmatter stays bounded (one stamp per memory, not per edit).
+
+export const PROMOTER_OWNER = "memory-promoter"
+export const DEFAULT_PROMOTE_TYPES: MemoryType[] = ["project", "reference", "feedback"]
+export const PROMOTION_LEDGER_FILE = "_memory-promotions.json"
+
+const STAMP_PREFIX = "memory:"
+const FAILURE_PREFIX = "failure:"
+
+/** `failure:<signature digest>@<recurrence bucket>` without the bucket. */
+function failureIdentity(stamp: string): string {
+  const at = stamp.lastIndexOf("@")
+  return at === -1 ? stamp : stamp.slice(0, at)
+}
+const MEMORY_TYPES: MemoryType[] = ["user", "feedback", "project", "reference"]
+
+export interface MemoryCandidate {
+  agentId: string
+  memory: MemoryRecord
+  /** Identity without version: `<agentId>/<type>_<name>` */
+  key: string
+  /** Identity + version: `memory:<key>@<updatedAt>`. Other sources use
+   *  their own namespace (`review:`, `failure:`). */
+  stamp: string
+  /** Distinct sessions a review finding or failure recurred in. More
+   *  occurrences rank first. */
+  occurrences?: number
+  /** Some of those sessions, kept as proposal evidence. */
+  sessions?: string[]
+  /** Some of the runs (task ids) behind a failure, kept as evidence. */
+  tasks?: string[]
+  /** What a recurring failure has in common: its signature and run count. */
+  failure?: { tool: string; errorClass: string; runs: number }
+}
+
+export interface PromotionLedgerEntry {
+  stamp: string
+  /** proposed: waiting for an operator; rejected: an operator said no. Both
+   *  keep the memory from being judged again until it changes. */
+  decision: "promoted" | "skipped" | "proposed" | "rejected"
+  /** Article path when promoted or proposed. */
+  article?: string
+  /** Proposal id when proposed or decided through one. */
+  proposal?: string
+  /** LLM skip reason. */
+  reason?: string
+  /** ISO run timestamp. */
+  at: string
+}
+
+export type PromotionLedger = PromotionLedgerEntry[]
+
+// --- Stamps -------------------------------------------------------------
+
+export function memoryKey(agentId: string, m: Pick<MemoryRecord, "type" | "name">): string {
+  return `${agentId}/${m.type}_${m.name}`
+}
+
+export function memoryStamp(agentId: string, m: Pick<MemoryRecord, "type" | "name" | "updatedAt">): string {
+  return `${STAMP_PREFIX}${memoryKey(agentId, m)}@${m.updatedAt}`
+}
+
+/** Parse a `memory:<agentId>/<type>_<name>@<updatedAt>` source stamp.
+ *  Returns null for anything else (raw entry ids, malformed stamps) so
+ *  callers can filter article `sources[]` safely. */
+export function parseMemoryStamp(s: string): {
+  agentId: string
+  type: MemoryType
+  name: string
+  updatedAt: string
+  key: string
+} | null {
+  if (!s.startsWith(STAMP_PREFIX)) return null
+  const rest = s.slice(STAMP_PREFIX.length)
+  const slash = rest.indexOf("/")
+  const at = rest.lastIndexOf("@")
+  if (slash <= 0 || at <= slash) return null
+  const agentId = rest.slice(0, slash)
+  const typeName = rest.slice(slash + 1, at)
+  const updatedAt = rest.slice(at + 1)
+  if (!updatedAt) return null
+  const underscore = typeName.indexOf("_")
+  if (underscore <= 0) return null
+  const type = typeName.slice(0, underscore) as MemoryType
+  const name = typeName.slice(underscore + 1)
+  if (!MEMORY_TYPES.includes(type) || !name) return null
+  return { agentId, type, name, updatedAt, key: `${agentId}/${typeName}` }
+}
+
+/** Merge new promotion stamps into an article's existing sources: a new
+ *  stamp REPLACES any prior stamp sharing its key (one stamp per memory,
+ *  not one per edit); everything else (raw entry ids, other memories'
+ *  stamps) is kept. Deduped, order-stable. */
+export function mergeSources(existing: string[] | undefined, newStamps: string[]): string[] {
+  const newKeys = new Set<string>()
+  for (const s of newStamps) {
+    const parsed = parseMemoryStamp(s)
+    if (parsed) newKeys.add(parsed.key)
+  }
+  const out: string[] = []
+  for (const s of existing ?? []) {
+    const parsed = parseMemoryStamp(s)
+    if (parsed && newKeys.has(parsed.key)) continue // superseded
+    if (!out.includes(s)) out.push(s)
+  }
+  for (const s of newStamps) {
+    if (!out.includes(s)) out.push(s)
+  }
+  return out
+}
+
+// --- Cross-agent memory enumeration --------------------------------------
+
+/** List every agent's memories. AgentMemory has no cross-agent API — we
+ *  enumerate the agent subdirs of `.agentx/agent-memory/` ourselves.
+ *  `memoryRoot` is the `.agentx` directory (AgentMemory's baseDir root). */
+export function listAllAgentMemories(
+  memoryRoot: string = resolve(process.cwd(), ".agentx"),
+): Array<{ agentId: string; memory: MemoryRecord }> {
+  const store = new AgentMemory({ baseDir: memoryRoot })
+  if (!existsSync(store.baseDir)) return []
+  const out: Array<{ agentId: string; memory: MemoryRecord }> = []
+  for (const entry of readdirSync(store.baseDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith("_") || entry.name.startsWith(".")) continue
+    for (const memory of store.list(entry.name)) {
+      out.push({ agentId: entry.name, memory })
+    }
+  }
+  return out
+}
+
+// --- Skip ledger ----------------------------------------------------------
+
+const LEDGER_DECISIONS = new Set(["promoted", "skipped", "proposed", "rejected"])
+
+export function readPromotionLedger(wikiBaseDir: string): PromotionLedger {
+  const path = resolve(wikiBaseDir, PROMOTION_LEDGER_FILE)
+  if (!existsSync(path)) return []
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf-8"))
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (e): e is PromotionLedgerEntry =>
+        e && typeof e.stamp === "string" && LEDGER_DECISIONS.has(e.decision),
+    )
+  } catch {
+    // Corrupt ledger → treat as empty. Worst case: skipped memories are
+    // re-judged once. Promoted memories stay deduped via article sources.
+    return []
+  }
+}
+
+/** Append entries and compact: keep only the newest entry per memory key
+ *  (per exact stamp for `review:` and `failure:` sources, where the later
+ *  entry wins) so the ledger stays bounded. */
+export function appendPromotionLedger(wikiBaseDir: string, entries: PromotionLedgerEntry[]): void {
+  const merged = [...readPromotionLedger(wikiBaseDir), ...entries]
+  const byKey = new Map<string, PromotionLedgerEntry>()
+  for (const e of merged) {
+    const parsed = parseMemoryStamp(e.stamp)
+    const key = parsed?.key ?? e.stamp
+    const prev = byKey.get(key)
+    // A non-memory stamp has no version to compare: the later decision
+    // (rejected after proposed) must replace the earlier one.
+    if (!prev || !parsed || (parseMemoryStamp(prev.stamp)?.updatedAt ?? "") <= parsed.updatedAt) {
+      byKey.set(key, e)
+    }
+  }
+  writeFileSync(
+    resolve(wikiBaseDir, PROMOTION_LEDGER_FILE),
+    JSON.stringify([...byKey.values()], null, 2),
+  )
+}
+
+// --- Clustering -------------------------------------------------------------
+
+export interface PromotionCluster {
+  /** ≥1 candidate; >1 when the same `<type>_<name>` exists on several agents. */
+  candidates: MemoryCandidate[]
+  corroboratingAgents: string[]
+  /** 0.5 base + 0.15 per extra corroborating agent + 0.05 for
+   *  project|reference types, capped at 0.95. Advisory only — shown to
+   *  the LLM judge, never a hard gate (mirrors clusterWorkflowCandidates). */
+  confidence: number
+}
+
+/** Group candidates that share `<type>_<name>` across agents. Exact-match
+ *  clustering only — two agents naming a memory identically is treated as
+ *  corroboration; fuzzy matching is future work. */
+export function groupCandidates(cands: MemoryCandidate[]): PromotionCluster[] {
+  const byName = new Map<string, MemoryCandidate[]>()
+  for (const c of cands) {
+    const k = `${c.memory.type}_${c.memory.name}`
+    const list = byName.get(k) ?? []
+    list.push(c)
+    byName.set(k, list)
+  }
+  return [...byName.values()].map((candidates) => {
+    const corroboratingAgents = [...new Set(candidates.map((c) => c.agentId))].sort()
+    const typeBoost = ["project", "reference"].includes(candidates[0].memory.type) ? 0.05 : 0
+    const confidence = Math.min(0.95, 0.5 + 0.15 * (corroboratingAgents.length - 1) + typeBoost)
+    return { candidates, corroboratingAgents, confidence }
+  })
+}
+
+// --- LLM response parsing ----------------------------------------------------
+
+export interface PromotedArticle {
+  path: string
+  title: string
+  type?: string
+  related?: string[]
+  tags: string[]
+  content: string
+  /** Validated stamps of the memories this article was promoted from. */
+  promotedFrom: string[]
+}
+
+export interface PromotionResponse {
+  articles: PromotedArticle[]
+  skipped: Array<{ stamp: string; reason: string }>
+  gaps: string[]
+  /** Stamp refs the LLM emitted that weren't in the offered set, plus
+   *  articles dropped for having zero valid stamps. For the report. */
+  warnings: string[]
+}
+
+/** Parse the promotion LLM's reply. Balanced-JSON extraction (adapted from
+ *  the wiki absorb CLI): find the outermost `{...}`, depth-scan to its
+ *  close, JSON.parse, then validate. Stamps not present in `offeredStamps`
+ *  are hallucinations — dropped; an article left with zero valid stamps is
+ *  dropped entirely (nothing to dedupe against on the next run). Any
+ *  failure returns `{error}` — the caller must write nothing. */
+export function parsePromotionResponse(
+  text: string,
+  offeredStamps: Set<string>,
+): PromotionResponse | { error: string } {
+  const start = text.indexOf("{")
+  if (start === -1) return { error: "no JSON object in response" }
+  let depth = 0
+  let end = -1
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) { escaped = false; continue }
+    if (ch === "\\") { escaped = true; continue }
+    if (ch === '"') { inString = !inString; continue }
+    if (inString) continue
+    if (ch === "{") depth++
+    else if (ch === "}") { depth--; if (depth === 0) { end = i + 1; break } }
+  }
+  if (end === -1) return { error: "unbalanced JSON in response" }
+
+  let parsed: any
+  try {
+    parsed = JSON.parse(text.slice(start, end))
+  } catch (e: any) {
+    return { error: `JSON parse error: ${e.message}` }
+  }
+  if (!parsed || typeof parsed !== "object" || !Array.isArray(parsed.articles)) {
+    return { error: "response JSON missing articles array" }
+  }
+
+  const warnings: string[] = []
+  const articles: PromotedArticle[] = []
+  for (const a of parsed.articles) {
+    if (!a || typeof a.path !== "string" || typeof a.title !== "string" || typeof a.content !== "string") {
+      warnings.push(`article missing path/title/content — dropped`)
+      continue
+    }
+    const raw = Array.isArray(a.promotedFrom) ? a.promotedFrom.filter((s: unknown) => typeof s === "string") : []
+    const promotedFrom = raw.filter((s: string) => offeredStamps.has(s))
+    for (const s of raw) {
+      if (!offeredStamps.has(s)) warnings.push(`article "${a.path}" references unknown stamp "${s}" — dropped`)
+    }
+    if (promotedFrom.length === 0) {
+      warnings.push(`article "${a.path}" has no valid promotedFrom stamps — dropped`)
+      continue
+    }
+    articles.push({
+      path: a.path,
+      title: a.title,
+      type: typeof a.type === "string" ? a.type : undefined,
+      related: Array.isArray(a.related) ? a.related.filter((r: unknown) => typeof r === "string") : undefined,
+      tags: Array.isArray(a.tags) ? a.tags.filter((t: unknown) => typeof t === "string") : [],
+      content: a.content,
+      promotedFrom,
+    })
+  }
+
+  const skipped: Array<{ stamp: string; reason: string }> = []
+  for (const s of Array.isArray(parsed.skipped) ? parsed.skipped : []) {
+    const stamp = typeof s?.memory === "string" ? s.memory : typeof s?.stamp === "string" ? s.stamp : ""
+    if (!offeredStamps.has(stamp)) {
+      if (stamp) warnings.push(`skip references unknown stamp "${stamp}" — dropped`)
+      continue
+    }
+    skipped.push({ stamp, reason: typeof s.reason === "string" ? s.reason : "" })
+  }
+
+  const gaps = Array.isArray(parsed.gaps) ? parsed.gaps.filter((g: unknown) => typeof g === "string") : []
+  return { articles, skipped, gaps, warnings }
+}
+
+// --- Candidate selection ---------------------------------------------------
+
+export interface UnpromotedOptions {
+  /** Memory types to consider. Default: project, reference, feedback. */
+  types?: MemoryType[]
+  /** Only memories updated within this window (ms before `now`). */
+  sinceMs?: number
+  /** Only this agent's memories. */
+  agentFilter?: string
+  /** Reference clock for `sinceMs` (injectable for tests). Default Date.now(). */
+  now?: number
+  /** Cap on returned candidates (newest first). Default 20. */
+  max?: number
+}
+
+/** Diff all agent memories against what's already been promoted (article
+ *  `sources[]` stamps across the shared index) or deliberately skipped
+ *  (ledger). A memory is a candidate iff its key is unseen OR its
+ *  `updatedAt` is newer than the recorded one — ISO-8601 strings compare
+ *  lexicographically, so plain `>` is safe. */
+export function getUnpromotedMemories(
+  all: Array<
+    // `stamp` is supplied by non-memory sources so their namespace
+    // survives; the evidence fields travel through to the proposal.
+    Pick<MemoryCandidate, "agentId" | "memory"> & Partial<Omit<MemoryCandidate, "agentId" | "memory" | "key">>
+  >,
+  index: WikiIndex,
+  ledger: PromotionLedger,
+  opts: UnpromotedOptions = {},
+): MemoryCandidate[] {
+  const types = opts.types ?? DEFAULT_PROMOTE_TYPES
+  const now = opts.now ?? Date.now()
+  const max = opts.max ?? 20
+
+  // key → newest updatedAt already handled (promoted or skipped)
+  const seen = new Map<string, string>()
+  // Exact stamps already handled. Non-memory sources (`review:`,
+  // `failure:`) have no parseable key/version, so this is how they are
+  // recognised as proposed, promoted, skipped or rejected instead of
+  // being offered again every night.
+  const handledStamps = new Set<string>()
+  const record = (stamp: string) => {
+    handledStamps.add(stamp)
+    const parsed = parseMemoryStamp(stamp)
+    if (!parsed) return
+    const prev = seen.get(parsed.key)
+    if (!prev || parsed.updatedAt > prev) seen.set(parsed.key, parsed.updatedAt)
+  }
+  for (const article of index.articles) {
+    for (const s of article.sources ?? []) record(s)
+  }
+  for (const e of ledger) record(e.stamp)
+  // A failure's stamp moves on as it recurs more (failure-candidates.ts);
+  // while one proposal for it waits for review, don't open a second.
+  const pendingFailures = new Set(ledger
+    .filter((e) => e.decision === "proposed" && e.stamp.startsWith(FAILURE_PREFIX))
+    .map((e) => failureIdentity(e.stamp)))
+
+  const candidates: MemoryCandidate[] = []
+  for (const { agentId, memory, stamp, occurrences, sessions, tasks, failure } of all) {
+    if (!types.includes(memory.type)) continue
+    if (opts.agentFilter && agentId !== opts.agentFilter) continue
+    if (opts.sinceMs !== undefined) {
+      const updated = Date.parse(memory.updatedAt)
+      if (!Number.isFinite(updated) || updated < now - opts.sinceMs) continue
+    }
+    if (stamp && handledStamps.has(stamp)) continue
+    if (stamp?.startsWith(FAILURE_PREFIX) && pendingFailures.has(failureIdentity(stamp))) continue
+    const key = memoryKey(agentId, memory)
+    const handled = seen.get(key)
+    if (handled && memory.updatedAt <= handled) continue
+    // A caller-supplied stamp is kept as-is. Re-deriving it would
+    // rewrite a `review:` stamp into the `memory:` namespace and lose
+    // the provenance the ledger needs to tell the two sources apart.
+    candidates.push({
+      agentId, memory, key, stamp: stamp ?? memoryStamp(agentId, memory), occurrences,
+      ...(sessions?.length ? { sessions } : {}),
+      ...(tasks?.length ? { tasks } : {}),
+      ...(failure ? { failure } : {}),
+    })
+  }
+
+  // Recurrence first where a source provides it, then recency. Memory
+  // candidates carry no count, so their ordering is unchanged.
+  return candidates
+    .sort((a, b) =>
+      (b.occurrences ?? 0) - (a.occurrences ?? 0) ||
+      b.memory.updatedAt.localeCompare(a.memory.updatedAt))
+    .slice(0, max)
+}
+
+// --- LLM transport -----------------------------------------------------------
+
+const ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
+const ANTHROPIC_VERSION = "2023-06-01"
+
+export interface PromotionLlmOptions {
+  /** Route through the daemon: POST /task to this agent. No API key needed —
+   *  the agent's own session handles auth (mirrors architectWorkflowViaAgent). */
+  viaAgent?: string
+  /** Direct Anthropic API model. Requires ANTHROPIC_API_KEY. */
+  model?: string
+  daemonUrl?: string
+  timeoutMs?: number
+  fetchImpl?: typeof fetch
+  /** Stable chat id so a retry's --resume replay sees the first reply. */
+  chatId?: string
+}
+
+/** Run the promotion prompt through an LLM and return the raw reply text.
+ *  Throws on transport failure — the caller decides whether to retry.
+ *  `feedback` turns the call into a correction round: the via-agent branch
+ *  resumes the same session; the direct branch replays the conversation. */
+export async function callPromotionLlm(
+  prompt: string,
+  opts: PromotionLlmOptions,
+  feedback: string | null = null,
+): Promise<string> {
+  const fetchImpl = opts.fetchImpl ?? fetch
+  const timeoutMs = opts.timeoutMs ?? 180_000
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    if (opts.viaAgent) {
+      const daemonUrl = (opts.daemonUrl ?? "http://127.0.0.1:18800").replace(/\/+$/, "")
+      const message = feedback
+        ? `Your previous response failed validation: ${feedback}\nRe-emit the FULL corrected JSON object — same structure, fixed issues, valid JSON only.`
+        : prompt
+      const res = await fetchImpl(`${daemonUrl}/task`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agent: opts.viaAgent,
+          message,
+          // First call gets a fresh session; the retry resumes it so the
+          // agent can fix its own output instead of starting over.
+          freshSession: feedback === null,
+          context: { channel: "api", chatId: opts.chatId ?? "memory-promote" },
+        }),
+        signal: ctrl.signal,
+      })
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => "")
+        throw new Error(`agent /task ${res.status}: ${errBody.slice(0, 500)}`)
+      }
+      const body: any = await res.json()
+      if (body.error) throw new Error(`agent reported error: ${body.error}`)
+      const content = String(body.content ?? "").trim()
+      if (!content) throw new Error("agent returned empty content")
+      return content
+    }
+
+    if (!opts.model) throw new Error("callPromotionLlm: viaAgent or model is required")
+    const apiKey = process.env.ANTHROPIC_API_KEY
+    if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set; use --via <agentId> instead")
+    const messages: Array<{ role: string; content: string }> = [{ role: "user", content: prompt }]
+    if (feedback) {
+      messages.push({ role: "assistant", content: "(previous attempt; will retry with corrections)" })
+      messages.push({ role: "user", content: `Your previous response failed validation: ${feedback}\nRe-emit the FULL corrected JSON object.` })
+    }
+    const res = await fetchImpl(ANTHROPIC_API, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": ANTHROPIC_VERSION,
+      },
+      body: JSON.stringify({ model: opts.model, max_tokens: 8000, messages }),
+      signal: ctrl.signal,
+    })
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "")
+      throw new Error(`anthropic API ${res.status}: ${errBody.slice(0, 500)}`)
+    }
+    const body: any = await res.json()
+    const blocks = Array.isArray(body.content) ? body.content : []
+    const text = blocks.filter((b: any) => b?.type === "text").map((b: any) => b.text).join("\n").trim()
+    if (!text) throw new Error("anthropic API returned no text content")
+    return text
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// --- Orchestrator ------------------------------------------------------------
+
+export interface RunPromotionOptions extends PromotionLlmOptions {
+  /** Wiki base dir (the shared store). Default `.agentx/wiki`. */
+  wikiDir?: string
+  /** The `.agentx` dir holding `agent-memory/`. Default `.agentx`. */
+  memoryRoot?: string
+  sinceMs?: number
+  agentFilter?: string
+  types?: MemoryType[]
+  max?: number
+  /** Candidates from somewhere other than agent memory — session-monitor
+   *  reviews and recurring failures. They join the same pool so they inherit
+   *  the ledger, the dedupe and the judge rather than getting a second
+   *  pipeline that drifts from this one. */
+  extraCandidates?: MemoryCandidate[]
+  /** Write proposals + ledger. Default false (dry-run). */
+  commit?: boolean
+  /** Upper bound on the judge prompt, in estimated tokens. Clusters are
+   *  dropped from the end (lowest ranked) until it fits; they stay
+   *  unledgered, so the next run picks them up. Default 60 000. */
+  budgetTokens?: number
+  log?: (msg: string) => void
+  /** Injectable clock (tests). */
+  now?: number
+}
+
+export interface PromotionReport {
+  candidates: MemoryCandidate[]
+  clusters: PromotionCluster[]
+  /** Proposals written this run; nothing reaches the wiki until approved. */
+  proposed: Array<{ id: string; path: string; title: string; type?: string; stamps: string[]; agents: string[]; occurrences: number }>
+  skipped: Array<{ stamp: string; reason: string }>
+  gaps: string[]
+  warnings: string[]
+  errors: string[]
+  dryRun: boolean
+}
+
+/** End-to-end promotion run: enumerate memories → diff against promoted/
+ *  skipped → cluster → (dry-run stops here) → LLM judge → write articles
+ *  with merged sources → ledger → rebuild index. Parses the full response
+ *  before any write — a bad reply writes nothing, and idempotency makes
+ *  the next scheduled run retry for free. */
+export async function runPromotion(opts: RunPromotionOptions = {}): Promise<PromotionReport> {
+  const wikiDir = opts.wikiDir ?? resolve(process.cwd(), ".agentx", "wiki")
+  const memoryRoot = opts.memoryRoot ?? resolve(process.cwd(), ".agentx")
+  const log = opts.log ?? (() => {})
+  const now = opts.now ?? Date.now()
+  const report: PromotionReport = {
+    candidates: [], clusters: [], proposed: [], skipped: [],
+    gaps: [], warnings: [], errors: [], dryRun: !opts.commit,
+  }
+
+  const store = new WikiStore(wikiDir, (...args: unknown[]) => log(args.map(String).join(" ")))
+  const index = store.rebuildIndex()
+  const ledger = readPromotionLedger(wikiDir)
+  const all = [...listAllAgentMemories(memoryRoot), ...(opts.extraCandidates ?? [])]
+
+  report.candidates = getUnpromotedMemories(all, index, ledger, {
+    types: opts.types,
+    sinceMs: opts.sinceMs,
+    agentFilter: opts.agentFilter,
+    now,
+    max: opts.max,
+  })
+  if (report.candidates.length === 0) {
+    log("no unpromoted memories in window")
+    return report
+  }
+  report.clusters = groupCandidates(report.candidates)
+  if (report.dryRun) return report
+
+  const articleList = index.articles.map((a) => ({ title: a.title, path: a.path, type: a.type }))
+  const worldview = store.getWorldview() ?? ""
+  const budget = opts.budgetTokens ?? DEFAULT_BUDGET_TOKENS
+  let clusters = report.clusters
+  let prompt = buildMemoryPromotePrompt(PROMOTER_OWNER, clusters, articleList, worldview)
+  while (estimateTokens(prompt) > budget && clusters.length > 1) {
+    clusters = clusters.slice(0, -1)
+    prompt = buildMemoryPromotePrompt(PROMOTER_OWNER, clusters, articleList, worldview)
+  }
+  if (estimateTokens(prompt) > budget) {
+    report.errors.push(`judge prompt (~${estimateTokens(prompt)} tokens) exceeds the ${budget}-token budget even with one cluster`)
+    return report
+  }
+  if (clusters.length < report.clusters.length) {
+    report.warnings.push(`token budget: judged ${clusters.length} of ${report.clusters.length} clusters; the rest wait for the next run`)
+  }
+  const judged = clusters.flatMap((c) => c.candidates)
+  const offered = new Set(judged.map((c) => c.stamp))
+  const chatId = opts.chatId ?? `memory-promote-${new Date(now).toISOString().slice(0, 10)}`
+
+  let parsed = parsePromotionResponse(await callPromotionLlm(prompt, { ...opts, chatId }), offered)
+  if ("error" in parsed) {
+    log(`parse failed (${parsed.error}) — retrying with feedback`)
+    parsed = parsePromotionResponse(await callPromotionLlm(prompt, { ...opts, chatId }, parsed.error), offered)
+  }
+  if ("error" in parsed) {
+    report.errors.push(`LLM response unusable after retry: ${parsed.error}`)
+    return report
+  }
+  report.warnings.push(...parsed.warnings)
+  report.gaps = parsed.gaps
+
+  const at = new Date(now).toISOString()
+  const ledgerEntries: PromotionLedgerEntry[] = []
+
+  const byStamp = new Map(judged.map((c) => [c.stamp, c]))
+  for (const article of parsed.articles) {
+    const existing = store.readArticle(article.path)
+    if (existing && !store.canWrite(existing.meta, PROMOTER_OWNER)) {
+      // Owned by another agent — a human resolves; stamps stay unledgered
+      // so the memory is retried after the standoff clears.
+      report.errors.push(`write denied for "${article.path}" (owned by ${existing.meta.owner ?? "?"})`)
+      continue
+    }
+    const evidence = evidenceFor(article.promotedFrom, byStamp)
+    const proposal: PromotionProposal = {
+      id: newProposalId(now, article.path),
+      createdAt: at,
+      status: "pending",
+      article,
+      evidence,
+      ...(existing ? { replaces: { lastUpdated: existing.meta.lastUpdated, contentHash: contentHash(existing.content) } } : {}),
+    }
+    saveProposal(wikiDir, proposal)
+    report.proposed.push({
+      id: proposal.id, path: article.path, title: article.title, type: article.type,
+      stamps: article.promotedFrom, agents: evidence.agents, occurrences: evidence.occurrences,
+    })
+    for (const stamp of article.promotedFrom) {
+      ledgerEntries.push({ stamp, decision: "proposed", article: article.path, proposal: proposal.id, at })
+    }
+  }
+
+  for (const s of parsed.skipped) {
+    ledgerEntries.push({ stamp: s.stamp, decision: "skipped", reason: s.reason, at })
+    report.skipped.push(s)
+  }
+
+  if (ledgerEntries.length) appendPromotionLedger(wikiDir, ledgerEntries)
+  return report
+}
+
+const DEFAULT_BUDGET_TOKENS = 60_000
+
+/** Rough token count (4 characters per token) — enough for a budget. */
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4)
+}
+
+function contentHash(content: string): string {
+  return createHash("sha256").update(content).digest("hex").slice(0, 16)
+}
+
+const EXCERPT_CHARS = 600
+
+/** Which pipeline a stamp came from. */
+export function sourceKind(stamp: string): ProposalSource["kind"] {
+  if (stamp.startsWith("review:")) return "review"
+  if (stamp.startsWith(FAILURE_PREFIX)) return "failure"
+  return "memory"
+}
+
+/** What a reviewer needs to judge a proposal: each source memory, review
+ *  finding or recurring failure, who wrote it and in which task, how often
+ *  it recurred, and some of the sessions and runs it came from. */
+export function evidenceFor(stamps: string[], byStamp: Map<string, MemoryCandidate>): PromotionProposal["evidence"] {
+  const sources: ProposalSource[] = []
+  for (const stamp of stamps) {
+    const c = byStamp.get(stamp)
+    if (!c) continue
+    sources.push({
+      stamp,
+      kind: sourceKind(stamp),
+      agentId: c.agentId,
+      type: c.memory.type,
+      name: c.memory.name,
+      description: c.memory.description,
+      ...(c.occurrences ? { occurrences: c.occurrences } : {}),
+      ...(c.sessions?.length ? { sessions: c.sessions } : {}),
+      ...(c.tasks?.length ? { tasks: c.tasks } : {}),
+      ...(c.failure ? { failure: c.failure } : {}),
+      ...(c.memory.author ? { author: c.memory.author } : {}),
+      ...(c.memory.taskId ? { taskId: c.memory.taskId } : {}),
+      updatedAt: c.memory.updatedAt,
+      excerpt: c.memory.body.slice(0, EXCERPT_CHARS),
+    })
+  }
+  return {
+    agents: [...new Set(sources.map((s) => s.agentId))].sort(),
+    occurrences: Math.max(1, ...sources.map((s) => s.occurrences ?? 1)),
+    sources,
+  }
+}
+
+// --- Review: approve or reject a proposal ------------------------------------
+
+export type ProposalDecisionResult =
+  | { ok: true; proposal: PromotionProposal }
+  | { ok: false; error: string }
+
+/** Write the proposed article into the shared wiki. Refuses when the
+ *  article changed (or appeared) since the proposal was made, unless
+ *  `force`, so an approval can't silently overwrite someone's edit. */
+export function approveProposal(
+  wikiDir: string, id: string, opts: { by?: string; force?: boolean; now?: number; log?: (m: string) => void } = {},
+): ProposalDecisionResult {
+  const proposal = readProposal(wikiDir, id)
+  if (!proposal) return { ok: false, error: `no proposal "${id}"` }
+  if (proposal.status !== "pending") return { ok: false, error: `proposal "${id}" is already ${proposal.status}` }
+
+  const log = opts.log ?? (() => {})
+  const store = new WikiStore(wikiDir, (...args: unknown[]) => log(args.map(String).join(" ")))
+  const { article } = proposal
+  const existing = store.readArticle(article.path)
+  if (!opts.force) {
+    if (existing && !proposal.replaces) {
+      return { ok: false, error: `"${article.path}" was created after this proposal; review it, then approve with --force` }
+    }
+    if (existing && proposal.replaces && contentHash(existing.content) !== proposal.replaces.contentHash) {
+      return { ok: false, error: `"${article.path}" changed since this proposal; review it, then approve with --force` }
+    }
+  }
+  const now = opts.now ?? Date.now()
+  const today = new Date(now).toISOString().slice(0, 10)
+  const ok = store.writeArticle(
+    article.path,
+    {
+      title: article.title,
+      type: isWikiArticleType(article.type) ? article.type : undefined,
+      related: article.related,
+      tags: article.tags,
+      owner: PROMOTER_OWNER,
+      access: "public",
+      created: existing?.meta.created ?? today,
+      lastUpdated: today,
+      sources: mergeSources(existing?.meta.sources, article.promotedFrom),
+    },
+    article.content,
+    PROMOTER_OWNER,
+  )
+  if (!ok) return { ok: false, error: `write denied for "${article.path}" (owned by ${existing?.meta.owner ?? "?"})` }
+
+  const at = new Date(now).toISOString()
+  appendPromotionLedger(wikiDir, article.promotedFrom.map((stamp) => ({
+    stamp, decision: "promoted" as const, article: article.path, proposal: id, at,
+  })))
+  store.rebuildIndex()
+  const decided: PromotionProposal = { ...proposal, status: "approved", decidedBy: opts.by ?? "operator", decidedAt: at }
+  saveProposal(wikiDir, decided)
+  return { ok: true, proposal: decided }
+}
+
+/** Decline a proposal. Its memories aren't judged again until they change. */
+export function rejectProposal(
+  wikiDir: string, id: string, opts: { by?: string; reason?: string; now?: number } = {},
+): ProposalDecisionResult {
+  const proposal = readProposal(wikiDir, id)
+  if (!proposal) return { ok: false, error: `no proposal "${id}"` }
+  if (proposal.status !== "pending") return { ok: false, error: `proposal "${id}" is already ${proposal.status}` }
+  const at = new Date(opts.now ?? Date.now()).toISOString()
+  appendPromotionLedger(wikiDir, proposal.article.promotedFrom.map((stamp) => ({
+    stamp, decision: "rejected" as const, article: proposal.article.path, proposal: id, reason: opts.reason, at,
+  })))
+  const decided: PromotionProposal = {
+    ...proposal, status: "rejected", decidedBy: opts.by ?? "operator", decidedAt: at,
+    ...(opts.reason ? { reason: opts.reason } : {}),
+  }
+  saveProposal(wikiDir, decided)
+  return { ok: true, proposal: decided }
+}

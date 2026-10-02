@@ -1,0 +1,18 @@
+[Unit]
+Description=9Router AI Gateway (127.0.0.1:20128)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=/home/USER
+Environment=NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+WorkingDirectory=/home/USER
+ExecStart=/usr/bin/9router -H 127.0.0.1 -p 20128 --no-browser --skip-update
+Restart=always
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

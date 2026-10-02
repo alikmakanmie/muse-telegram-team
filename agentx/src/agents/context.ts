@@ -1,0 +1,626 @@
+// --- Agent Context Engine ---
+//
+// Structured, layered context with token budget management.
+// Each context layer has a priority, max tokens, and rules.
+//
+// Layers (highest priority first):
+//   1. Channel   — where the message came from + channel-specific rules
+//   2. Scope     — group/personal/project + scope-specific constraints
+//   3. Landscape — world model: team roster, channels, rules (cached at startup)
+//   4. Identity  — who the agent is, what it can do
+//   5. Intent    — what the user is asking about (extracted from message)
+//   6. Artifacts — project, issue, MR, file references
+//   7. History   — group conversation log or session history
+//   8. Wiki      — relevant knowledge articles
+//
+// Token budget: each layer gets a max allocation. Total capped at configurable limit.
+// Layers are rendered top-down; if budget exhausted, lower layers are truncated or skipped.
+
+export interface ContextLayer {
+  name: string
+  priority: number       // lower = higher priority (1 = most important)
+  maxTokens: number      // max tokens for this layer
+  content: string        // rendered text
+  tags: string[]         // metadata tags for filtering/matching
+  rules?: string[]       // constraints/instructions specific to this layer
+}
+
+export interface ContextConfig {
+  /** Total token budget for all context combined (default: 4000) */
+  totalBudget: number
+  /** Per-layer budgets override (layer name -> max tokens) */
+  layerBudgets?: Record<string, number>
+}
+
+const DEFAULT_CONFIG: ContextConfig = {
+  totalBudget: 6000,
+  layerBudgets: {
+    channel: 200,
+    scope: 200,
+    landscape: 800,
+    identity: 200,
+    bootstrap: 500,
+    references: 500,
+    intent: 200,
+    artifacts: 500,
+    procedures: 400,
+    memory: 400,
+    history: 1200,
+    "cross-chat": 800,
+    // The wiki is the long-term store, so it gets the room and the
+    // priority. Skills, procedures, patterns and memory are all derived
+    // from it or staged into it; when the budget is tight they are the
+    // ones that should shrink, not the source of truth. Until this was
+    // inverted the wiki had the lowest priority of the five and half the
+    // budget of skills, which is why agents read everything except it.
+    wiki: 2500,
+  },
+}
+
+// Rough estimate: 1 token ≈ 4 chars for English
+const CHARS_PER_TOKEN = 4
+
+export interface ContextInput {
+  // Channel layer
+  channel: string                    // "telegram", "whatsapp", "gitlab", "discord"
+  channelScope?: "group" | "personal" | "project"
+  /** Canonical chat id used by routing — telegram user/group id, github
+   *  "owner/repo:issue:N", whatsapp jid, etc. Surfaced verbatim in the
+   *  prompt so the agent can pass it back to /recall and /send without
+   *  guessing. */
+  chatId?: string
+
+  // Bootstrap identity files (from workspace)
+  bootstrapContext?: string          // from buildBootstrapContext()
+
+  // Verified deterministic references (from references registry + recipes)
+  references?: string                // from renderReferences()
+
+  // Behavioral patterns (self-improving loop)
+  patternContext?: string            // from PatternStore.buildContext()
+
+  // Matched procedures (user-perspective SOPs — known-good step sequences)
+  procedureContext?: string          // from renderProcedureContext()
+
+  // Auto-injected skills (matched to current message)
+  skillInjection?: string            // from getAutoInjectSkills()
+
+  // Scope layer
+  groupName?: string
+  projectPath?: string               // "org/my-project"
+  issueMR?: { type: string; iid: string; title: string }
+
+  // Identity layer
+  agentId: string
+  agentName: string
+  agentHandle?: string               // "@my_bot"
+  systemPrompt?: string
+
+  // Participants
+  sender: string
+  senderId?: string                  // platform user ID (e.g. Telegram user ID)
+  senderUsername?: string            // platform username (e.g. @username)
+  senderRole?: string                // "user", "agent:other-agent"
+
+  // Landscape (cached world model from LandscapeBuilder)
+  landscape?: string
+
+  // Channel meta (verified facts from the channel adapter — prevents hallucination)
+  channelMeta?: {
+    agents?: Array<{ id: string; name: string; handle?: string }>
+    project?: string
+    issue?: { type: string; iid: string; title: string }
+    facts?: string[]
+  }
+
+  // Artifacts
+  mediaPath?: string
+  mediaType?: string
+  replyToText?: string
+
+  // Memory (persistent cross-session facts)
+  memoryContext?: string              // from MemoryStore.buildContext()
+
+  // History
+  groupHistory?: string              // from GroupLog.buildContext()
+  sessionHistory?: string            // from SessionStore.buildHistoryContext()
+  crossChatContext?: string           // from SessionStore.getCrossSessionSummary()
+  /** Long-memory recall pre-fetched by the registry when the user message
+   *  contains an explicit long-memory cue ("yesterday", "last week",
+   *  "remember when…"). Saves the agent a /recall round-trip in obvious
+   *  cases and prevents context-loss from being papered over with
+   *  fabricated facts via unrelated tools. */
+  longMemoryRecall?: string
+
+  // Wiki
+  wikiContext?: string               // from WikiStore.buildContext()
+
+  // Handover — one-shot note injected on the first message after an
+  // operator-initiated handover takes effect. See channels/handover-store.
+  handoverNote?: {
+    fromAgent: string
+    summary?: string
+    at: string                       // ISO timestamp of the handover
+  }
+
+  // Continuity memo distilled from this chat's previous (rotated) Claude
+  // session. Injected on FRESH sessions only (registry gates on
+  // !resumeSessionId) so an ongoing task survives rotation instead of
+  // the agent opening with amnesia. See SessionStore rotation memos.
+  rotationMemo?: {
+    memo: string
+    reason: string                   // stale | tier-2 | max-turns
+    capturedAt: string               // ISO timestamp of the rotation
+  }
+
+  // Events matched by the agent's `digest` subscriptions since its last
+  // turn. FRESH sessions only (registry gates on !resumeSessionId): a
+  // resumed session reads newer events with agentx_events instead.
+  eventDigest?: string
+
+  // How to show files on this channel (the phone app's <agentx-artifact>
+  // lines). FRESH sessions only (registry-gated): the resumed session
+  // already has it from its first turn.
+  attachHint?: string
+
+  // Intent (graph classification — when absent, Intent layer falls back
+  // to the legacy regex tag extractor).
+  intent?: {
+    path: string[]                   // root → leaf node ids
+    pathLabel: string                // "Business › Acme › DevOps › Review MR"
+    pathId: string                   // hash — also carried as wiki `graph:<pathId>` tag
+    axes?: Record<string, Record<string, string>>
+    leaf?: { input?: string; output?: string }
+    status: "pending" | "approved"
+  }
+
+  // Message
+  message: string
+}
+
+/**
+ * Build optimized context string from structured input.
+ * Respects token budgets per layer and total cap.
+ */
+export function buildAgentContext(input: ContextInput, config: ContextConfig = DEFAULT_CONFIG): string {
+  const layers = buildLayers(input, config)
+
+  // Sort by priority (lower = first)
+  layers.sort((a, b) => a.priority - b.priority)
+
+  // Render within budget
+  const parts: string[] = []
+  let totalChars = 0
+  const maxChars = config.totalBudget * CHARS_PER_TOKEN
+
+  for (const layer of layers) {
+    if (!layer.content) continue
+
+    const layerMaxChars = layer.maxTokens * CHARS_PER_TOKEN
+    const trimmed = layer.content.length > layerMaxChars
+      ? layer.content.slice(0, layerMaxChars) + "..."
+      : layer.content
+
+    if (totalChars + trimmed.length > maxChars) {
+      // Budget exhausted — add what fits or skip
+      const remaining = maxChars - totalChars
+      if (remaining > 100) {
+        parts.push(trimmed.slice(0, remaining) + "...")
+      }
+      break
+    }
+
+    parts.push(trimmed)
+    totalChars += trimmed.length
+  }
+
+  return parts.join("\n\n")
+}
+
+/**
+ * Build individual context layers from input.
+ */
+function buildLayers(input: ContextInput, config: ContextConfig): ContextLayer[] {
+  const budget = (name: string, fallback: number) =>
+    config.layerBudgets?.[name] ?? fallback
+
+  const layers: ContextLayer[] = []
+
+  // 1. Channel layer
+  layers.push(buildChannelLayer(input, budget("channel", 200)))
+
+  // 2. Scope layer
+  layers.push(buildScopeLayer(input, budget("scope", 200)))
+
+  // 3. Landscape (cached world model — team, channels, rules)
+  if (input.landscape) {
+    layers.push({
+      name: "landscape",
+      priority: 3,
+      maxTokens: budget("landscape", 350),
+      content: input.landscape,
+      tags: ["landscape", "world-model"],
+    })
+  }
+
+  // 4. Identity (only first line of systemPrompt — agent already has CLAUDE.md)
+  if (input.systemPrompt) {
+    layers.push({
+      name: "identity",
+      priority: 4,
+      maxTokens: budget("identity", 200),
+      content: input.systemPrompt.split("\n")[0],
+      tags: ["identity", input.agentId],
+    })
+  }
+
+  // 4.5 Bootstrap identity files (SOUL.md, IDENTITY.md, USER.md, AGENTS.md)
+  if (input.bootstrapContext) {
+    layers.push({
+      name: "bootstrap",
+      priority: 4.5,
+      maxTokens: budget("bootstrap", 500),
+      content: input.bootstrapContext,
+      tags: ["bootstrap", "identity", "personality"],
+    })
+  }
+
+  // 4.7 Verified references — deterministic facts (SSH hosts, project IDs,
+  //     paths, contacts) resolved from the references registry + recipes.
+  //     Sits before Intent so the agent reads facts before interpretation.
+  if (input.references) {
+    layers.push({
+      name: "references",
+      priority: 4.7,
+      maxTokens: budget("references", 500),
+      content: input.references,
+      tags: ["references", "verified", "deterministic"],
+    })
+  }
+
+  // 5. Intent — prefer graph classification (hierarchical path) when the
+  //    caller ran the classifier. Fall back to the regex tag extractor
+  //    otherwise so legacy installs with graph.enabled=false behave as before.
+  if (input.intent && input.intent.path.length > 0) {
+    const lines: string[] = [
+      `[Intent path: ${input.intent.pathLabel}${input.intent.status === "pending" ? " (pending approval)" : ""}]`,
+    ]
+    const leafId = input.intent.path[input.intent.path.length - 1]
+    const leafAxes = input.intent.axes?.[leafId]
+    if (leafAxes && Object.keys(leafAxes).length) {
+      const kv = Object.entries(leafAxes)
+        .map(([k, v]) => `  ${k}: ${v}`)
+        .join("\n")
+      lines.push(kv)
+    }
+    if (input.intent.leaf?.input) lines.push(`  input: ${input.intent.leaf.input}`)
+    layers.push({
+      name: "intent",
+      priority: 5,
+      maxTokens: budget("intent", 200),
+      content: lines.join("\n"),
+      tags: ["intent", ...input.intent.path],
+    })
+  } else {
+    const intentTags = extractIntentTags(input.message)
+    if (intentTags.length) {
+      layers.push({
+        name: "intent",
+        priority: 5,
+        maxTokens: budget("intent", 200),
+        content: `[Intent: ${intentTags.join(", ")}]`,
+        tags: intentTags,
+      })
+    }
+  }
+
+  // 6. Artifacts (media, reply-to, issue/MR context)
+  const artifactLines: string[] = []
+  if (input.replyToText) {
+    artifactLines.push(`[Replying to]: ${input.replyToText.slice(0, 300)}`)
+  }
+  if (input.mediaPath) {
+    artifactLines.push(`[Attached file: ${input.mediaPath}]`)
+    artifactLines.push(`[File type: ${input.mediaType || "unknown"}]`)
+    if (input.mediaType?.startsWith("image/")) artifactLines.push("Please view this image and respond to it.")
+    else if (input.mediaType?.startsWith("audio/")) artifactLines.push("Please transcribe this audio and respond.")
+  }
+  if (input.issueMR) {
+    artifactLines.push(`[${input.issueMR.type} #${input.issueMR.iid}: ${input.issueMR.title}]`)
+  }
+  if (artifactLines.length) {
+    layers.push({
+      name: "artifacts",
+      priority: 6,
+      maxTokens: budget("artifacts", 500),
+      content: artifactLines.join("\n"),
+      tags: ["artifacts", ...(input.mediaType ? ["media"] : [])],
+    })
+  }
+
+  // 6.2 Auto-injected skills (matched to current task)
+  if (input.skillInjection) {
+    layers.push({
+      name: "skills",
+      priority: 6.4,
+      maxTokens: budget("skills", 800),
+      content: input.skillInjection,
+      tags: ["skills", "auto-inject"],
+    })
+  }
+
+  // 6.3 Behavioral patterns (self-improving loop)
+  if (input.patternContext) {
+    layers.push({
+      name: "patterns",
+      priority: 6.5,
+      maxTokens: budget("patterns", 300),
+      content: input.patternContext,
+      tags: ["patterns", "behavioral", "self-improving"],
+    })
+  }
+
+  // 6.4 Matched procedures (mined SOPs — the known-good path for this task)
+  if (input.procedureContext) {
+    layers.push({
+      name: "procedures",
+      priority: 6.6,
+      maxTokens: budget("procedures", 400),
+      content: input.procedureContext,
+      tags: ["procedures", "sop"],
+    })
+  }
+
+  // 6.5 Agent memory (persistent cross-session facts from Haiku extraction)
+  if (input.memoryContext) {
+    layers.push({
+      name: "memory",
+      priority: 6.7,
+      maxTokens: budget("memory", 400),
+      content: input.memoryContext,
+      tags: ["memory", "persistent"],
+    })
+  }
+
+  // 7. History (group > session — prefer group if available)
+  const history = input.groupHistory || input.sessionHistory
+  if (history) {
+    layers.push({
+      name: "history",
+      priority: 7,
+      maxTokens: budget("history", 1200),
+      content: history,
+      tags: ["history", "conversation"],
+    })
+  }
+
+  // 7b. Cross-chat context (bridges DM ↔ group amnesia)
+  if (input.crossChatContext) {
+    layers.push({
+      name: "cross-chat",
+      priority: 7,
+      maxTokens: budget("cross-chat", 800),
+      content: input.crossChatContext,
+      tags: ["history", "cross-chat"],
+    })
+  }
+
+  // 7c. Long-memory recall (cue-triggered: "yesterday", "remember", etc.)
+  if (input.longMemoryRecall) {
+    layers.push({
+      name: "long-memory",
+      priority: 7,
+      maxTokens: budget("long-memory", 1500),
+      content: input.longMemoryRecall,
+      tags: ["history", "long-memory"],
+    })
+  }
+
+  // 7c. Handover note — one-shot briefing when this agent is taking over
+  //      a conversation from another agent. Rendered just before wiki.
+  if (input.handoverNote) {
+    const lines = [
+      `[Handover] You are taking over this conversation from ${input.handoverNote.fromAgent}.`,
+    ]
+    if (input.handoverNote.summary) {
+      lines.push(`Operator summary: ${input.handoverNote.summary}`)
+    }
+    lines.push(`Handover time: ${input.handoverNote.at}`)
+    layers.push({
+      name: "handover",
+      priority: 7.5,
+      maxTokens: budget("handover", 400),
+      content: lines.join("\n"),
+      tags: ["handover", input.handoverNote.fromAgent],
+    })
+  }
+
+  // 7d. Rotation continuity memo — the previous Claude session for this
+  //      chat was rotated (${reason}); its distilled facts/open tasks are
+  //      handed to the fresh session so the conversation picks up where
+  //      it left off. Only present on fresh sessions (registry-gated).
+  if (input.rotationMemo) {
+    layers.push({
+      name: "rotation-memo",
+      priority: 7.6,
+      maxTokens: budget("rotation-memo", 800),
+      content: [
+        `[Continuity memo — your previous session for this chat ended (${input.rotationMemo.reason}, ${input.rotationMemo.capturedAt}). Carry on from this work state; do not claim you lack prior context. It is a summary, not checked facts: re-check account, billing, outage or deploy state before stating it, or say it is unverified and ask the owner:]`,
+        input.rotationMemo.memo,
+      ].join("\n"),
+      tags: ["continuity", "rotation-memo"],
+    })
+  }
+
+  // 7e. Event digest — subscribed events since the agent's last turn.
+  //      Fresh sessions only (registry-gated).
+  if (input.eventDigest) {
+    layers.push({
+      name: "events",
+      priority: 7.7,
+      maxTokens: budget("events", 500),
+      content: input.eventDigest,
+      tags: ["events", "subscriptions"],
+    })
+  }
+
+  // 7f. How to attach files on this channel. Fresh sessions only.
+  if (input.attachHint) {
+    layers.push({
+      name: "attachments",
+      priority: 2.5,
+      maxTokens: budget("attachments", 250),
+      content: input.attachHint,
+      tags: ["channel", "attachments"],
+    })
+  }
+
+  // 8. Wiki knowledge
+  if (input.wikiContext) {
+    layers.push({
+      name: "wiki",
+      priority: 6.1,
+      maxTokens: budget("wiki", 2500),
+      content: input.wikiContext,
+      tags: ["wiki", "knowledge"],
+    })
+  }
+
+  return layers
+}
+
+/**
+ * Build channel-specific context with rules.
+ */
+function buildChannelLayer(input: ContextInput, maxTokens: number): ContextLayer {
+  const lines: string[] = [`Channel: ${input.channel}`]
+  if (input.chatId) lines.push(`Chat ID: ${input.chatId}  (use this verbatim in /recall, /send)`)
+  const rules: string[] = []
+  const tags = [input.channel]
+
+  switch (input.channel) {
+    case "telegram":
+      if (input.agentHandle) lines.push(`Your handle: ${input.agentHandle}`)
+      lines.push(`From: ${input.sender}`)
+      if (input.senderId) lines.push(`Telegram user ID: ${input.senderId}`)
+      if (input.senderUsername) lines.push(`Username: @${input.senderUsername}`)
+      rules.push("Format responses using Telegram-compatible markdown")
+      rules.push("Be brief — 2-4 sentences max for the main point. Humans scan, not read")
+      rules.push("Lead with the action or answer, skip preamble")
+      break
+
+    case "whatsapp":
+      lines.push(`From: ${input.sender}`)
+      rules.push("Be brief — 2-3 sentences max. WhatsApp is mobile-first")
+      rules.push("No rich formatting — plain text only")
+      rules.push("Lead with the action or answer, skip preamble")
+      break
+
+    case "gitlab":
+      lines.push(`From: ${input.sender}`)
+      rules.push("Reply as a short, actionable GitLab comment — 3-5 lines for the main message")
+      rules.push("Do NOT mention Telegram handles — they don't work on GitLab")
+      rules.push("Do NOT delegate to other agents")
+      rules.push("Reference issues with #IID and merge requests with !IID")
+      rules.push("Put verbose details (logs, full commands, step-by-step) inside collapsible sections: <details><summary>Title</summary>\\n\\ncontent\\n</details>")
+      rules.push("Never narrate what you are about to do — just do it and report the result")
+      tags.push("code-review")
+      break
+
+    case "discord":
+      lines.push(`From: ${input.sender}`)
+      rules.push("Use Discord markdown for formatting")
+      rules.push("Be brief — 2-4 sentences for the main point")
+      break
+
+    default:
+      if (input.channel.startsWith("webhook:")) {
+        rules.push("This is an automated event — respond with actionable steps")
+        tags.push("webhook", "automated")
+      }
+  }
+
+  if (rules.length) {
+    lines.push("")
+    lines.push("[Rules]")
+    lines.push(...rules.map(r => `- ${r}`))
+  }
+
+  return { name: "channel", priority: 1, maxTokens, content: lines.join("\n"), tags, rules }
+}
+
+/**
+ * Build scope context (group/personal/project).
+ */
+function buildScopeLayer(input: ContextInput, maxTokens: number): ContextLayer {
+  const lines: string[] = []
+  const tags: string[] = []
+
+  if (input.channelScope === "group" && input.groupName) {
+    lines.push(`Group: ${input.groupName}`)
+    tags.push("group", input.groupName)
+  } else if (input.channelScope === "project" && input.projectPath) {
+    lines.push(`Project: ${input.projectPath}`)
+    tags.push("project", input.projectPath)
+  } else if (input.channelScope === "personal") {
+    lines.push("Direct message")
+    tags.push("dm")
+  }
+
+  // Inject verified channel metadata (prevents hallucination)
+  if (input.channelMeta) {
+    const meta = input.channelMeta
+    if (meta.agents?.length) {
+      lines.push(`[Verified bots in this chat: ${meta.agents.map(a => a.handle || a.name || a.id).join(", ")}]`)
+      lines.push("Only mention these agents as group members — do NOT assume others are present.")
+    }
+    if (meta.project) {
+      lines.push(`Project: ${meta.project}`)
+    }
+    if (meta.issue) {
+      lines.push(`${meta.issue.type} #${meta.issue.iid}${meta.issue.title ? `: ${meta.issue.title}` : ""}`)
+    }
+    if (meta.facts?.length) {
+      for (const fact of meta.facts) {
+        lines.push(`• ${fact}`)
+      }
+    }
+  }
+
+  return { name: "scope", priority: 2, maxTokens, content: lines.join("\n"), tags }
+}
+
+/**
+ * Extract intent tags from message (lightweight, no LLM).
+ */
+function extractIntentTags(message: string): string[] {
+  const tags: string[] = []
+  const lower = message.toLowerCase()
+
+  // Action intents
+  if (/deploy|push|release|ship/.test(lower)) tags.push("deployment")
+  if (/review|check|look at|approve/.test(lower)) tags.push("review")
+  if (/fix|bug|broken|error|issue/.test(lower)) tags.push("bugfix")
+  if (/create|add|build|implement/.test(lower)) tags.push("feature")
+  if (/test|spec|coverage/.test(lower)) tags.push("testing")
+  if (/refactor|clean|improve/.test(lower)) tags.push("refactor")
+  if (/docs|document|readme/.test(lower)) tags.push("docs")
+  if (/security|vuln|auth|token/.test(lower)) tags.push("security")
+  if (/perf|slow|optim|fast/.test(lower)) tags.push("performance")
+  if (/status|update|progress|standup/.test(lower)) tags.push("status")
+  if (/help|how|what|explain/.test(lower)) tags.push("question")
+
+  // Domain intents
+  if (/gitlab|merge|mr|issue|pipeline/.test(lower)) tags.push("gitlab")
+  if (/seo|analytics|content|marketing/.test(lower)) tags.push("marketing")
+  if (/infra|server|docker|k8s|devops/.test(lower)) tags.push("devops")
+
+  return tags
+}
+
+/**
+ * Estimate token count from text.
+ */
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / CHARS_PER_TOKEN)
+}

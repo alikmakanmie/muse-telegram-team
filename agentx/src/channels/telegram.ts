@@ -1,0 +1,1370 @@
+import type { ChannelAdapter, IncomingMessage, OutgoingMessage, ChannelMeta, SeededMessage } from "./types"
+import { markdownToTelegramHtml } from "./telegram-format"
+import { splitMessageText, TG_CHUNK_CHARS, TG_MAX_MESSAGE_CHARS } from "./message-chunks"
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs"
+import { resolve, dirname, basename, extname } from "path"
+import { getCursorStore, type CursorStore } from "./cursor-store"
+
+// --- Telegram Bot API adapter (long-polling, no dependencies) ---
+
+type OutPoll = { name: string; values: string[]; selectableCount?: number }
+type OutMedia = { type: "image" | "document" | "audio" | "video"; url: string; caption?: string }
+
+/** Build sendPoll params. Telegram requires 2–10 options; `allows_multiple_answers`
+ *  is on when the caller asked to select more than one. Pure — unit-testable. */
+export function pollParams(chatId: string, poll: OutPoll, replyTo?: string): Record<string, unknown> {
+  const options = poll.values.slice(0, 10)
+  const params: Record<string, unknown> = {
+    chat_id: chatId,
+    question: poll.name.slice(0, 300),
+    options: JSON.stringify(options),
+    is_anonymous: false,
+    allows_multiple_answers: (poll.selectableCount ?? 1) > 1,
+  }
+  if (replyTo) params.reply_to_message_id = parseInt(replyTo, 10)
+  return params
+}
+
+/** Map an outbound media object to the Bot API method + params. Pure. */
+export function mediaSendSpec(chatId: string, media: OutMedia, replyTo?: string): { method: string; params: Record<string, unknown> } {
+  const method =
+    media.type === "image" ? "sendPhoto" :
+    media.type === "audio" ? "sendAudio" :
+    media.type === "video" ? "sendVideo" : "sendDocument"
+  const field =
+    media.type === "image" ? "photo" :
+    media.type === "audio" ? "audio" :
+    media.type === "video" ? "video" : "document"
+  const params: Record<string, unknown> = { chat_id: chatId, [field]: media.url }
+  if (media.caption) params.caption = media.caption
+  if (replyTo) params.reply_to_message_id = parseInt(replyTo, 10)
+  return { method, params }
+}
+
+/** The Bot API form field for an outbound media type. */
+export function mediaFieldFor(type: OutMedia["type"]): string {
+  return type === "image" ? "photo" : type === "audio" ? "audio" : type === "video" ? "video" : "document"
+}
+
+const MIME_BY_EXT: Record<string, string> = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+  ".webp": "image/webp", ".pdf": "application/pdf", ".mp4": "video/mp4", ".mp3": "audio/mpeg",
+  ".ogg": "audio/ogg", ".txt": "text/plain", ".html": "text/html", ".svg": "image/svg+xml",
+}
+
+interface TelegramUpdate {
+  update_id: number
+  message?: {
+    message_id: number
+    from: { id: number; first_name: string; last_name?: string; username?: string; is_bot?: boolean }
+    chat: { id: number; type: string; title?: string }
+    text?: string
+    caption?: string
+    date: number
+    reply_to_message?: { message_id: number; text?: string; caption?: string; from?: { first_name: string } }
+    photo?: Array<{ file_id: string; file_unique_id: string; width: number; height: number; file_size?: number }>
+    voice?: { file_id: string; duration: number; mime_type?: string }
+    audio?: { file_id: string; duration: number; mime_type?: string; title?: string }
+    video?: { file_id: string; duration: number; mime_type?: string }
+    document?: { file_id: string; file_name?: string; mime_type?: string }
+    sticker?: { file_id: string; emoji?: string }
+  }
+  my_chat_member?: {
+    chat: { id: number; type: string; title?: string }
+    from: { id: number; first_name: string }
+    new_chat_member: {
+      user: { id: number; username?: string; is_bot?: boolean }
+      status: string // "member" | "administrator" | "left" | "kicked" | "creator"
+    }
+  }
+}
+
+interface TelegramAccountConfig {
+  token: string
+  agentBinding: string
+  allowFrom?: string[]
+  /** When false, register the token for outbound send only (no long-poll). */
+  pollInbound?: boolean
+}
+
+function describeError(e: any): string {
+  const parts = [e?.message || String(e)]
+  const cause = e?.cause
+  if (cause?.code) parts.push(`code=${cause.code}`)
+  if (cause?.message && cause.message !== e?.message) parts.push(`cause=${cause.message}`)
+  return parts.join(" ")
+}
+
+// --- Persistent group membership store ---
+// Tracks which bots are in which groups, persisted to .agentx/telegram/groups.json
+// Updated via my_chat_member events and one-time API seed per group.
+
+interface GroupMembership {
+  /** groupId → { accountId → { username, status, updatedAt } } */
+  [groupId: string]: {
+    name?: string
+    bots: {
+      [accountId: string]: {
+        username: string
+        agentId: string
+        status: string // "member" | "administrator" | "left" | "kicked"
+        updatedAt: string
+      }
+    }
+  }
+}
+
+class TelegramGroupStore {
+  private data: GroupMembership = {}
+  private filePath: string
+  private dirty = false
+
+  constructor(dataDir: string) {
+    this.filePath = resolve(dataDir, ".agentx/telegram/groups.json")
+    this.load()
+  }
+
+  private load(): void {
+    try {
+      if (existsSync(this.filePath)) {
+        this.data = JSON.parse(readFileSync(this.filePath, "utf-8"))
+      }
+    } catch {
+      this.data = {}
+    }
+  }
+
+  private save(): void {
+    try {
+      mkdirSync(dirname(this.filePath), { recursive: true })
+      writeFileSync(this.filePath, JSON.stringify(this.data, null, 2))
+      this.dirty = false
+    } catch {
+      // best-effort
+    }
+  }
+
+  /** Record a bot's membership status in a group. */
+  setBotStatus(groupId: string, groupName: string | undefined, accountId: string, agentId: string, username: string, status: string): void {
+    if (!this.data[groupId]) {
+      this.data[groupId] = { name: groupName, bots: {} }
+    }
+    if (groupName) this.data[groupId].name = groupName
+    this.data[groupId].bots[accountId] = {
+      username,
+      agentId,
+      status,
+      updatedAt: new Date().toISOString(),
+    }
+    this.dirty = true
+    this.save()
+  }
+
+  /** Get all active bots in a group. */
+  getGroupBots(groupId: string): Array<{ accountId: string; agentId: string; username: string }> {
+    const group = this.data[groupId]
+    if (!group) return []
+    return Object.entries(group.bots)
+      .filter(([, info]) => info.status !== "left" && info.status !== "kicked")
+      .map(([accountId, info]) => ({
+        accountId,
+        agentId: info.agentId,
+        username: info.username,
+      }))
+  }
+
+  /** Check if we have data for a group. */
+  hasGroup(groupId: string): boolean {
+    return !!this.data[groupId]
+  }
+
+  /** All groups this store knows about, with their best-effort display name. */
+  listGroups(): Array<{ id: string; name?: string; botCount: number }> {
+    return Object.entries(this.data).map(([id, g]) => ({
+      id,
+      name: g.name,
+      botCount: Object.values(g.bots).filter((b) => b.status !== "left" && b.status !== "kicked").length,
+    }))
+  }
+}
+
+/**
+ * @deprecated Replaced by FileCursorStore in src/channels/cursor-store.ts.
+ * Kept temporarily for callers we haven't migrated yet; do not introduce
+ * new uses. The ad-hoc 500ms debounce here was the root cause of the
+ * 2026-04-27 message-replay incident.
+ *
+ * Persist long-poll `offset` per account to disk so a daemon restart doesn't
+ * re-fetch updates Telegram still holds in its 24h retention window. Without
+ * this, a crash loop (e.g. restart-counter cascade) causes the same message
+ * to be handled N times — seen on 2026-04-15 when peer spun through 20
+ * systemd restarts while a zombie daemon held the pidfile, resulting in 6×
+ * duplicate replies from the queued incoming messages.
+ */
+class TelegramOffsetStore {
+  private offsets: Record<string, number> = {}
+  private filePath: string
+  private dirty = false
+  private saveTimer?: ReturnType<typeof setTimeout>
+
+  constructor(dataDir: string) {
+    this.filePath = resolve(dataDir, ".agentx/telegram/offsets.json")
+    try {
+      if (existsSync(this.filePath)) {
+        this.offsets = JSON.parse(readFileSync(this.filePath, "utf-8"))
+      }
+    } catch { this.offsets = {} }
+  }
+
+  get(accountId: string): number {
+    return this.offsets[accountId] || 0
+  }
+
+  set(accountId: string, offset: number): void {
+    if (this.offsets[accountId] === offset) return
+    this.offsets[accountId] = offset
+    this.dirty = true
+    // Debounce disk writes — each poll can produce many offset updates.
+    if (!this.saveTimer) {
+      this.saveTimer = setTimeout(() => this.flush(), 500)
+    }
+  }
+
+  flush(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer)
+      this.saveTimer = undefined
+    }
+    if (!this.dirty) return
+    try {
+      const dir = dirname(this.filePath)
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+      writeFileSync(this.filePath, JSON.stringify(this.offsets, null, 2))
+      this.dirty = false
+    } catch { /* best-effort */ }
+  }
+}
+
+export class TelegramAdapter implements ChannelAdapter {
+  readonly name = "telegram"
+  private accounts: Map<string, TelegramAccountConfig>
+  private cursors: CursorStore
+  private handler?: (msg: IncomingMessage) => Promise<void>
+  private polling = false
+  /** Per-account polling gate — flipped to false when an account is removed
+   *  or its token changes, so its pollLoop observes the stop and exits without
+   *  affecting siblings. Keyed by accountId. */
+  private accountPolling = new Map<string, boolean>()
+  private accountVerifyRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  private log: (...args: unknown[]) => void
+  /** Global allowlist fallback. When a per-account allowFrom is unset,
+   *  this list applies. When BOTH are unset, everything is rejected
+   *  (closed by default). */
+  private globalAllowFrom?: string[]
+
+  constructor(
+    accounts: Record<string, TelegramAccountConfig>,
+    opts: { policy?: { allowFrom?: string[] } } = {},
+    log: (...args: unknown[]) => void = console.error.bind(console, "[telegram]"),
+  ) {
+    this.accounts = new Map(Object.entries(accounts))
+    this.globalAllowFrom = opts.policy?.allowFrom
+    this.log = log
+    this.groupStore = new TelegramGroupStore(process.cwd())
+    this.cursors = getCursorStore(process.cwd())
+  }
+
+  /** Effective sender allowlist for an account. Returns undefined when the
+   *  account has no explicit config AND the global policy is unset — the
+   *  caller treats undefined as "closed, drop everything". */
+  private effectiveAllowFrom(accountId: string): string[] | undefined {
+    const cfg = this.accounts.get(accountId)
+    if (cfg?.allowFrom !== undefined) return cfg.allowFrom
+    return this.globalAllowFrom
+  }
+
+  /** Accept a message only when at least one allowlist entry matches the
+   *  sender's user id, the chat id, or the sender's @username. */
+  private isAllowed(
+    accountId: string,
+    fromId: number | string | undefined,
+    chatId: number | string | undefined,
+    fromUsername?: string,
+  ): boolean {
+    const list = this.effectiveAllowFrom(accountId)
+    if (!list || list.length === 0) return false
+    const fromStr = fromId != null ? String(fromId) : ""
+    const chatStr = chatId != null ? String(chatId) : ""
+    const userLc = fromUsername?.toLowerCase()
+    for (const entry of list) {
+      if (!entry) continue
+      if (entry === fromStr || entry === chatStr) return true
+      if (entry.startsWith("@") && userLc && entry.slice(1).toLowerCase() === userLc) return true
+    }
+    return false
+  }
+
+  onMessage(handler: (msg: IncomingMessage) => Promise<void>): void {
+    this.handler = handler
+  }
+
+  async start(): Promise<void> {
+    this.polling = true
+
+    const entries = Array.from(this.accounts.entries())
+    this.log(`${entries.length} Telegram account(s) to start`)
+
+    for (let i = 0; i < entries.length; i++) {
+      const [accountId, config] = entries[i]
+      await this.startAccount(accountId, config, { index: i + 1, of: entries.length })
+      // Small delay between account starts to avoid Telegram rate limits
+      if (i < entries.length - 1) {
+        await new Promise((r) => setTimeout(r, 300))
+      }
+    }
+
+    this.log(`All ${entries.length} Telegram account(s) started`)
+  }
+
+  /** Start a single account's poll loop. Used by both start() (boot) and
+   *  reloadAccounts() (hot-add on /reload). Verifies the bot token, records
+   *  the bot's identity, then spawns the long-poll loop. No-op if the account
+   *  is already polling. */
+  private async startAccount(
+    accountId: string,
+    config: TelegramAccountConfig,
+    meta: { index?: number; of?: number } = {},
+  ): Promise<void> {
+    if (this.accountPolling.get(accountId)) {
+      this.log(`Account "${accountId}" already polling — skipping duplicate start`)
+      return
+    }
+    const prefix = meta.index != null && meta.of != null
+      ? `(${meta.index}/${meta.of})`
+      : "(hot-reload)"
+    // Send-only mode: keep the token registered for outbound send()/ring but
+    // don't long-poll. Used when the bound agent lives on a different daemon
+    // — otherwise both daemons race on getUpdates and Telegram returns 409.
+    if (config.pollInbound === false) {
+      this.log(`Account "${accountId}" ${prefix} — send-only (pollInbound=false), skipping getUpdates loop`)
+      try {
+        const me = await this.apiCall(config.token, "getMe")
+        const botUserId = me.result?.id
+        const botUsername = me.result?.username
+        if (botUserId) {
+          this.botInfo.set(accountId, { userId: botUserId, username: botUsername || accountId })
+        }
+      } catch (e: any) {
+        this.log(`Send-only account "${accountId}" getMe failed: ${e.message} — send may still work if token is valid`)
+      }
+      return
+    }
+    this.log(`Starting polling for account "${accountId}" ${prefix}`)
+    try {
+      // Drop any stale webhook/long-poll session from a previous run.
+      // This prevents 409 conflicts when restarting.
+      await this.apiCall(config.token, "deleteWebhook", { drop_pending_updates: false }).catch(() => {})
+
+      // Retry getMe with backoff. Cold-start fleet boot does N parallel
+      // verifications and a transient `fetch failed` (DNS/TLS hiccup,
+      // upstream 502) used to silently skip the account permanently —
+      // observed in production when 2 of 7 bots dropped out for the rest
+      // of the session. Three tries at 2s/5s/10s catches the common case
+      // without delaying the legit-failure path much.
+      let me: any
+      let lastErr: any
+      const delays = [0, 2000, 5000, 10000]
+      for (let attempt = 0; attempt < delays.length; attempt++) {
+        if (delays[attempt] > 0) await new Promise((r) => setTimeout(r, delays[attempt]))
+        try {
+          me = await this.apiCall(config.token, "getMe")
+          if (attempt > 0) this.log(`Bot account "${accountId}" verified on retry ${attempt}`)
+          break
+        } catch (e: any) {
+          lastErr = e
+          if (attempt < delays.length - 1) {
+            this.log(`Verify attempt ${attempt + 1} failed for "${accountId}" (${e.message}) — retrying`)
+          }
+        }
+      }
+      if (!me) throw lastErr
+      const botUserId = me.result?.id
+      const botUsername = me.result?.username
+      this.log(`Bot @${botUsername} ready (account: ${accountId})`)
+      if (botUserId) {
+        this.botInfo.set(accountId, { userId: botUserId, username: botUsername || accountId })
+      }
+      this.accountPolling.set(accountId, true)
+      this.pollLoop(accountId, config)
+    } catch (e: any) {
+      this.log(`Failed to verify bot for account "${accountId}" after retries: ${e.message}`)
+      this.scheduleVerifyRetry(accountId)
+    }
+  }
+
+  private scheduleVerifyRetry(accountId: string): void {
+    if (!this.polling || this.accountVerifyRetryTimers.has(accountId)) return
+    const timer = setTimeout(() => {
+      this.accountVerifyRetryTimers.delete(accountId)
+      const cfg = this.accounts.get(accountId)
+      if (!cfg || !this.polling || this.accountPolling.get(accountId)) return
+      this.log(`Retrying Telegram account "${accountId}" after failed startup verification`)
+      void this.startAccount(accountId, cfg)
+    }, 30_000)
+    this.accountVerifyRetryTimers.set(accountId, timer)
+  }
+
+  /** Stop a single account's poll loop without touching siblings. Flips the
+   *  per-account gate and aborts the in-flight long-poll so Telegram releases
+   *  the server-side session immediately (otherwise a new start with the same
+   *  token hits 409 Conflict). */
+  private async stopAccount(accountId: string): Promise<void> {
+    this.accountPolling.set(accountId, false)
+    const cfg = this.accounts.get(accountId)
+    if (!cfg) return
+    try {
+      await this.apiCall(cfg.token, "getUpdates", { offset: -1, timeout: 0 })
+    } catch {
+      // Best-effort
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.polling = false
+    for (const timer of this.accountVerifyRetryTimers.values()) clearTimeout(timer)
+    this.accountVerifyRetryTimers.clear()
+    // Cursors commit synchronously per-update now (FileCursorStore), so
+    // there's nothing to flush here — every offset advance has already
+    // landed on disk before the next getUpdates ack.
+    const aborts = Array.from(this.accounts.keys()).map((id) => this.stopAccount(id))
+    await Promise.allSettled(aborts)
+  }
+
+  /** Hot-reload the account map in place. Diffs the new config against the
+   *  current one: removed accounts get their pollers stopped, added accounts
+   *  get started, and accounts whose token changed get restarted (allowFrom
+   *  changes are effectively read-through via effectiveAllowFrom so they
+   *  don't need a restart, but we do refresh the stored config). Returns the
+   *  diff for the caller to log/surface.
+   *
+   *  Requires the adapter to be already started (polling=true). */
+  async reloadAccounts(
+    next: Record<string, TelegramAccountConfig>,
+    policy?: { allowFrom?: string[] },
+  ): Promise<{ added: string[]; removed: string[]; tokenChanged: string[] }> {
+    if (!this.polling) {
+      // Adapter hasn't been started — just swap the map, start() will use it.
+      this.accounts = new Map(Object.entries(next))
+      this.globalAllowFrom = policy?.allowFrom
+      return { added: [], removed: [], tokenChanged: [] }
+    }
+
+    const oldIds = new Set(this.accounts.keys())
+    const newIds = new Set(Object.keys(next))
+    const added: string[] = []
+    const removed: string[] = []
+    const tokenChanged: string[] = []
+
+    // Update the global allowlist unconditionally — it's read-through.
+    this.globalAllowFrom = policy?.allowFrom
+
+    // 1. Removed accounts — stop + drop from map.
+    for (const id of oldIds) {
+      if (newIds.has(id)) continue
+      await this.stopAccount(id)
+      this.accounts.delete(id)
+      this.botInfo.delete(id)
+      removed.push(id)
+    }
+
+    // 2. Retained accounts — swap config in place (for allowFrom etc.) and
+    //    restart when the token changed, since pollLoop captures the token
+    //    in its closure argument.
+    for (const id of newIds) {
+      if (!oldIds.has(id)) continue
+      const oldCfg = this.accounts.get(id)!
+      const newCfg = next[id]
+      this.accounts.set(id, newCfg)
+      if (oldCfg.token !== newCfg.token) {
+        await this.stopAccount(id)
+        await this.startAccount(id, newCfg)
+        tokenChanged.push(id)
+      }
+    }
+
+    // 3. Added accounts — write config then start polling.
+    for (const id of newIds) {
+      if (oldIds.has(id)) continue
+      this.accounts.set(id, next[id])
+      await this.startAccount(id, next[id])
+      added.push(id)
+    }
+
+    return { added, removed, tokenChanged }
+  }
+
+  /**
+   * Get token for a specific account ID. Used by router to send from correct bot.
+   */
+  getTokenForAccount(accountId: string): string | undefined {
+    return this.accounts.get(accountId)?.token
+  }
+
+  /**
+   * Get the default (first) account token as fallback.
+   */
+  private getDefaultToken(): string | undefined {
+    const [, config] = Array.from(this.accounts.entries())[0]
+    return config?.token
+  }
+
+  /**
+   * Resolve which token to use: prefer accountId, fall back to chatAccountMap, then default.
+   */
+  private resolveToken(chatId: string, accountId?: string): string | undefined {
+    if (accountId) {
+      const token = this.getTokenForAccount(accountId)
+      if (token) return token
+    }
+    return this.chatAccountMap.get(chatId)
+      ? this.getTokenForAccount(this.chatAccountMap.get(chatId)!)
+      : this.getDefaultToken()
+  }
+
+  /** Track which account a chat was last seen on (for DMs) */
+  private chatAccountMap: Map<string, string> = new Map()
+  // Bot user IDs and usernames resolved at startup (accountId → { userId, username })
+  private botInfo: Map<string, { userId: number; username: string }> = new Map()
+  // Persistent group membership store
+  private groupStore: TelegramGroupStore
+
+  /** Account IDs of bots currently active (member/administrator) in a group.
+   *  Used by the router to pick the correct bot when an agent has multiple
+   *  Telegram accounts bound to it (e.g. pm-initech → both @acme_initech_bot and
+   *  @acme_pm_initech_bot) — the in-group account should win, otherwise messages
+   *  to the absent bot get silently dropped by multi-account-dedup. */
+  getGroupBotAccounts(groupId: string): string[] {
+    return this.groupStore.getGroupBots(groupId).map((b) => b.accountId)
+  }
+
+  /**
+   * Send a message. Returns the sent message ID.
+   * Pass accountId to send from a specific bot account.
+   */
+  async send(msg: OutgoingMessage & { accountId?: string }): Promise<string> {
+    const token = this.resolveToken(msg.chatId, msg.accountId)
+    if (!token) {
+      this.log("No telegram token found for sending")
+      return ""
+    }
+
+    // Rich payloads are their own Telegram message types.
+    if (msg.poll) {
+      const result = await this.apiCall(token, "sendPoll", pollParams(msg.chatId, msg.poll, msg.replyTo))
+      const id = String(result.result?.message_id || "")
+      this.recordOutboundShadow(msg.chatId, id, `[poll] ${msg.poll.name}`, msg.agentId, msg.accountId)
+      // A poll carries no free text, but callers may pass a caption in text.
+      if (!msg.text?.trim()) return id
+    }
+    if (msg.media) {
+      const { method, params } = mediaSendSpec(msg.chatId, msg.media, msg.replyTo)
+      // A local file path can't go through the JSON API (Telegram only accepts
+      // a public URL or file_id there) — upload it as multipart instead. This
+      // is how agent-created deliverables (posters, PDFs) reach the chat.
+      const localPath = !/^https?:\/\//i.test(msg.media.url) && existsSync(msg.media.url) ? msg.media.url : null
+      const result = localPath
+        ? await this.apiUpload(token, method, msg.chatId, mediaFieldFor(msg.media.type), localPath, msg.media.caption, msg.replyTo)
+        : await this.apiCall(token, method, params)
+      const id = String(result.result?.message_id || "")
+      this.recordOutboundShadow(msg.chatId, id, `[${msg.media.type}] ${msg.media.url}`, msg.agentId, msg.accountId)
+      if (!msg.text?.trim()) return id
+    }
+
+    const chunks = splitMessageText(msg.text, TG_CHUNK_CHARS)
+    let firstMessageId = ""
+
+    for (let i = 0; i < chunks.length; i++) {
+      const text = chunks[i]
+      const isLast = i === chunks.length - 1
+      // Buttons attach to the last chunk only.
+      const replyMarkup = isLast && msg.buttons?.length ? this.inlineKeyboardMarkup(msg.buttons) : undefined
+
+      const formatted = msg.parseMode === "markdown" || msg.parseMode === undefined
+        ? markdownToTelegramHtml(text)
+        : text
+
+      const params: Record<string, unknown> = {
+        chat_id: msg.chatId,
+        text: formatted,
+        parse_mode: "HTML",
+      }
+      if (replyMarkup) params.reply_markup = replyMarkup
+
+      if (msg.replyTo && i === 0) {
+        params.reply_to_message_id = parseInt(msg.replyTo, 10)
+      }
+
+      if (msg.parseMode === "html") {
+        params.parse_mode = "HTML"
+        params.text = text
+      } else if (msg.parseMode === "plain") {
+        delete params.parse_mode
+        params.text = text
+      }
+
+      try {
+        const result = await this.apiCall(token, "sendMessage", params)
+        const messageId = String(result.result?.message_id || "")
+        if (!firstMessageId) firstMessageId = messageId
+        this.recordOutboundShadow(msg.chatId, messageId, text, msg.agentId, msg.accountId)
+      } catch (e: any) {
+        if (params.parse_mode) {
+          delete params.parse_mode
+          params.text = text
+          const result = await this.apiCall(token, "sendMessage", params)
+          const messageId = String(result.result?.message_id || "")
+          if (!firstMessageId) firstMessageId = messageId
+          this.recordOutboundShadow(msg.chatId, messageId, text, msg.agentId, msg.accountId)
+          continue
+        }
+        throw e
+      }
+    }
+    return firstMessageId
+  }
+
+  /** Add/replace inline URL buttons on an existing message (editMessageReplyMarkup).
+   *  Used to attach an agentx:ui button row to a streamed reply. Best-effort. */
+  async setMessageButtons(
+    chatId: string,
+    messageId: string,
+    buttons: Array<{ label: string; url: string }>,
+    accountId?: string,
+  ): Promise<boolean> {
+    const token = this.resolveToken(chatId, accountId)
+    if (!token || !buttons.length) return false
+    try {
+      await this.apiCall(token, "editMessageReplyMarkup", {
+        chat_id: chatId,
+        message_id: parseInt(messageId, 10),
+        reply_markup: this.inlineKeyboardMarkup(buttons),
+      })
+      return true
+    } catch (e: any) {
+      this.log(`setMessageButtons failed for ${chatId}/${messageId}: ${describeError(e)}`)
+      return false
+    }
+  }
+
+  /** Best-effort outbound shadow log. Captures every successful send into
+   *  the same per-chat shadow file the inbound writer uses, so seedHistory
+   *  + agent introspection see a complete picture (which bot identity sent
+   *  what, at which time). Failures are swallowed — the message already
+   *  went out on the wire; logging is observability, not correctness. */
+  private recordOutboundShadow(
+    chatId: string,
+    messageId: string,
+    content: string,
+    agentId?: string,
+    accountId?: string,
+  ): void {
+    if (!messageId) return // Telegram returned no id (formatted retry path leaves us nothing to dedup on)
+    try {
+      this.appendShadowLog(chatId, {
+        externalId: messageId,
+        role: "agent",
+        // Prefer agentId for the rendered "Agent: ..." line; fall back to
+        // accountId so even un-attributed sends (e.g., manual /send tests)
+        // surface a name in seeded history.
+        name: agentId || accountId || "agent",
+        content,
+        timestamp: new Date().toISOString(),
+        accountId,
+      })
+    } catch (e: any) {
+      this.log(`outbound shadow-log write failed: ${e.message}`)
+    }
+  }
+
+  /**
+   * Send a message with an inline keyboard. Used by the workflow user-task
+   * renderer so approve/reject-style tasks get one-tap URL buttons in
+   * Telegram pointing at the daemon's one-click submit endpoint.
+   *
+   * Each button is a URL button (not callback_data) so the user's client
+   * opens the link in a browser — this avoids wiring callback_query
+   * plumbing through the adapter's polling loop for Phase 3 MVP.
+   */
+  async sendWithInlineButtons(args: {
+    chatId: string
+    text: string
+    buttons: Array<{ label: string; url: string }>
+    accountId?: string
+    parseMode?: "markdown" | "html" | "plain"
+  }): Promise<string> {
+    const token = this.resolveToken(args.chatId, args.accountId)
+    if (!token) { this.log("No telegram token found for sending"); return "" }
+
+    // Overflow-safe: earlier chunks send plain, the buttons attach to the
+    // LAST chunk. Previously kept `[0]` only and silently dropped the tail.
+    const chunks = splitMessageText(args.text, TG_CHUNK_CHARS)
+    let firstMessageId = ""
+    for (let i = 0; i < chunks.length; i++) {
+      const isLast = i === chunks.length - 1
+      const id = await this.sendOneWithMarkup(
+        token,
+        args.chatId,
+        chunks[i],
+        args.parseMode,
+        isLast ? this.inlineKeyboardMarkup(args.buttons) : undefined,
+      )
+      if (!firstMessageId) firstMessageId = id
+    }
+    return firstMessageId
+  }
+
+  /** Build a Telegram inline_keyboard reply_markup from URL buttons (one row
+   *  per button). Shared by sendWithInlineButtons and send()'s `buttons`. */
+  private inlineKeyboardMarkup(buttons: Array<{ label: string; url: string }>): string {
+    return JSON.stringify({
+      inline_keyboard: buttons.map((b) => [{ text: b.label, url: b.url }]),
+    })
+  }
+
+  /** Send a single (already chunk-sized) message with optional reply_markup,
+   *  with the standard HTML→plain parse-mode fallback. Returns message id. */
+  private async sendOneWithMarkup(
+    token: string,
+    chatId: string,
+    text: string,
+    parseMode: "markdown" | "html" | "plain" | undefined,
+    replyMarkup?: string,
+  ): Promise<string> {
+    const formatted = parseMode === "markdown" || parseMode === undefined
+      ? markdownToTelegramHtml(text)
+      : text
+    const params: Record<string, unknown> = {
+      chat_id: chatId,
+      text: formatted,
+      parse_mode: parseMode === "plain" ? undefined : "HTML",
+    }
+    if (replyMarkup) params.reply_markup = replyMarkup
+    if (params.parse_mode === undefined) delete params.parse_mode
+    try {
+      const result = await this.apiCall(token, "sendMessage", params)
+      return String(result.result?.message_id || "")
+    } catch (e: any) {
+      if (params.parse_mode) {
+        delete params.parse_mode
+        params.text = text
+        const result = await this.apiCall(token, "sendMessage", params)
+        return String(result.result?.message_id || "")
+      }
+      throw e
+    }
+  }
+
+  /**
+   * Edit an existing message (for streaming updates).
+   */
+  async editMessage(chatId: string, messageId: string, text: string, parseMode?: string, accountId?: string): Promise<boolean> {
+    const token = this.resolveToken(chatId, accountId)
+    if (!token) return false
+
+    // The router owns chunk-spill and never edits a message with more than one
+    // chunk's worth of text — so DON'T silently drop overflow here (the old
+    // `splitMessageText(text,3900)[0]` was the streaming-truncation bug).
+    // Keep only a defensive hard-cap guard against Telegram's 4096 ceiling.
+    const trimmed = text.length > TG_MAX_MESSAGE_CHARS
+      ? text.slice(0, TG_MAX_MESSAGE_CHARS)
+      : text
+
+    const formatted = parseMode !== "html" && parseMode !== "plain"
+      ? markdownToTelegramHtml(trimmed)
+      : trimmed
+
+    const params: Record<string, unknown> = {
+      chat_id: chatId,
+      message_id: parseInt(messageId, 10),
+      text: formatted,
+      parse_mode: "HTML",
+    }
+
+    if (parseMode === "html") {
+      params.parse_mode = "HTML"
+      params.text = trimmed
+    } else if (parseMode === "plain") {
+      delete params.parse_mode
+      params.text = trimmed
+    }
+
+    try {
+      await this.apiCall(token, "editMessageText", params)
+      return true
+    } catch (e: any) {
+      if (e.message?.includes("message is not modified")) return true
+      if (params.parse_mode) {
+        delete params.parse_mode
+        params.text = trimmed
+        try {
+          await this.apiCall(token, "editMessageText", params)
+          return true
+        } catch (retryError: any) {
+          this.log(`editMessageText failed for ${chatId}/${messageId}: ${describeError(retryError)}`)
+          return false
+        }
+      }
+      this.log(`editMessageText failed for ${chatId}/${messageId}: ${describeError(e)}`)
+      return false
+    }
+  }
+
+  /**
+   * Push a streaming draft to a private chat (Bot API 9.5+ `sendMessageDraft`).
+   * Subsequent calls with the same `draftId` animate in place — much smoother
+   * than `editMessageText` and not subject to the same edit-rate limits.
+   *
+   * **Constraint:** private chats only (DMs). Telegram returns an error for
+   * groups/channels. Callers must check `isDirectMessage(chatId)` first.
+   *
+   * Returns `true` on success, `false` on any error (best-effort streaming —
+   * never throw or callers will lose blocks). Falls back to no-formatting on
+   * a parse-mode error so a malformed HTML chunk doesn't kill the stream.
+   */
+  async sendDraft(
+    chatId: string,
+    draftId: number,
+    text: string,
+    parseMode?: string,
+    accountId?: string,
+  ): Promise<boolean> {
+    if (!TelegramAdapter.isDirectMessage(chatId)) return false
+    const token = this.resolveToken(chatId, accountId)
+    if (!token) return false
+
+    // Draft is a DM-only transient typing affordance (not a persistent
+    // message), so a hard cap is acceptable here — the real reply is delivered
+    // separately via send()/editMessage which chunk-spill.
+    const trimmed = text.length > TG_MAX_MESSAGE_CHARS ? text.slice(0, TG_MAX_MESSAGE_CHARS - 3) + "..." : text
+    if (!trimmed) return false
+
+    const formatted = parseMode !== "html" && parseMode !== "plain"
+      ? markdownToTelegramHtml(trimmed)
+      : trimmed
+
+    const params: Record<string, unknown> = {
+      chat_id: parseInt(chatId, 10),
+      draft_id: draftId,
+      text: formatted,
+      parse_mode: "HTML",
+    }
+    if (parseMode === "plain") {
+      delete params.parse_mode
+      params.text = trimmed
+    } else if (parseMode === "html") {
+      params.text = trimmed
+    }
+
+    try {
+      await this.apiCall(token, "sendMessageDraft", params)
+      return true
+    } catch (e: any) {
+      // Retry without parse_mode if HTML parsing tripped on a partial fragment
+      // (common while streaming — half a tag mid-buffer).
+      if (params.parse_mode) {
+        delete params.parse_mode
+        params.text = trimmed
+        try {
+          await this.apiCall(token, "sendMessageDraft", params)
+          return true
+        } catch { return false }
+      }
+      return false
+    }
+  }
+
+  /** Telegram convention: positive chat_id → private chat (DM with a user),
+   *  negative → group/supergroup/channel. Used to gate features that only
+   *  work in DMs (sendMessageDraft, message_effect_id, ...). */
+  static isDirectMessage(chatId: string): boolean {
+    const n = parseInt(chatId, 10)
+    return Number.isFinite(n) && n > 0
+  }
+
+  /**
+   * React to a message with an emoji.
+   */
+  async react(chatId: string, messageId: string, emoji: string = "👀", accountId?: string): Promise<void> {
+    const token = this.resolveToken(chatId, accountId)
+    if (!token) return
+
+    try {
+      await this.apiCall(token, "setMessageReaction", {
+        chat_id: chatId,
+        message_id: parseInt(messageId, 10),
+        reaction: [{ type: "emoji", emoji }],
+      })
+    } catch {
+      // Best-effort
+    }
+  }
+
+  /**
+   * Send typing indicator.
+   */
+  async sendTyping(chatId: string, accountId?: string): Promise<void> {
+    const token = this.resolveToken(chatId, accountId)
+    if (!token) return
+
+    try {
+      await this.apiCall(token, "sendChatAction", {
+        chat_id: chatId,
+        action: "typing",
+      })
+    } catch {
+      // Best-effort
+    }
+  }
+
+  // --- Internal ---
+
+  private async pollLoop(accountId: string, config: TelegramAccountConfig): Promise<void> {
+    let consecutiveErrors = 0
+
+    while (this.polling && this.accountPolling.get(accountId) !== false) {
+      try {
+        const stored = this.cursors.read("telegram", accountId)
+        const offset = typeof stored === "number" ? stored : 0
+        const data = await this.apiCall(config.token, "getUpdates", {
+          offset: offset || undefined,
+          timeout: 30,
+          allowed_updates: ["message", "my_chat_member"],
+        })
+
+        const updates: TelegramUpdate[] = data.result || []
+
+        for (const update of updates) {
+          // Synchronous commit BEFORE we hand the message to the router. The
+          // next getUpdates with this offset is what acks the upstream — if
+          // we crash between this line and the next poll, restart resumes
+          // from the same offset and Telegram redelivers the unprocessed
+          // updates. (Pre-2026-04-27 the old TelegramOffsetStore debounced
+          // 500ms, which left a window where Telegram had already deleted
+          // the message but the disk still pointed at the old offset.)
+          this.cursors.commit("telegram", accountId, update.update_id + 1)
+
+          if (update.message && this.handler) {
+            const msg = update.message
+
+            // Skip messages sent by the bot itself (prevents self-message loops in groups)
+            const botInfo = this.botInfo.get(accountId)
+            if (botInfo && msg.from && msg.from.id === botInfo.userId) {
+              continue
+            }
+
+            // Extract text from any message type
+            let text = msg.text || msg.caption || ""
+            let mediaInfo: IncomingMessage["media"] | undefined
+
+            // Handle media messages
+            const hasPhoto = msg.photo && msg.photo.length > 0
+            const hasVoice = !!msg.voice
+            const hasAudio = !!msg.audio
+            const hasVideo = !!msg.video
+            const hasDocument = !!msg.document
+            const hasMedia = hasPhoto || hasVoice || hasAudio || hasVideo || hasDocument
+
+            if (hasMedia) {
+              // Download media file
+              let fileId: string | undefined
+              let mime = "application/octet-stream"
+
+              if (hasPhoto) {
+                fileId = msg.photo![msg.photo!.length - 1].file_id // largest photo
+                mime = "image/jpeg"
+                if (!text) text = "[Photo attached — please describe what you see]"
+              } else if (hasVoice) {
+                fileId = msg.voice!.file_id
+                mime = msg.voice!.mime_type || "audio/ogg"
+                if (!text) text = "[Voice message — please transcribe and respond]"
+              } else if (hasAudio) {
+                fileId = msg.audio!.file_id
+                mime = msg.audio!.mime_type || "audio/mpeg"
+                if (!text) text = `[Audio: ${msg.audio!.title || "audio file"}]`
+              } else if (hasVideo) {
+                fileId = msg.video!.file_id
+                mime = msg.video!.mime_type || "video/mp4"
+                if (!text) text = "[Video attached]"
+              } else if (hasDocument) {
+                fileId = msg.document!.file_id
+                mime = msg.document!.mime_type || "application/octet-stream"
+                if (!text) text = `[Document: ${msg.document!.file_name || "file"}]`
+              }
+
+              if (fileId) {
+                try {
+                  // Get file path from Telegram
+                  const fileInfo = await this.apiCall(config.token, "getFile", { file_id: fileId })
+                  const filePath = fileInfo.result?.file_path
+                  if (filePath) {
+                    // Download file
+                    const fileUrl = `https://api.telegram.org/file/bot${config.token}/${filePath}`
+                    const res = await fetch(fileUrl)
+                    if (res.ok) {
+                      const buffer = Buffer.from(await res.arrayBuffer())
+                      const ext = mime.split("/")[1]?.split(";")[0] || "bin"
+                      const { mkdirSync, writeFileSync } = await import("fs")
+                      const { randomUUID } = await import("crypto")
+                      const { resolve, join } = await import("path")
+                      const mediaDir = resolve(process.cwd(), ".agentx/media/telegram")
+                      mkdirSync(mediaDir, { recursive: true })
+                      const fileName = msg.document?.file_name || `${randomUUID()}.${ext}`
+                      const localPath = join(mediaDir, fileName)
+                      writeFileSync(localPath, buffer)
+                      mediaInfo = { path: localPath, type: mime, fileName }
+                    }
+                  }
+                } catch (e: any) {
+                  this.log(`Media download failed: ${e.message}`)
+                }
+              }
+            }
+
+            if (!text) continue
+
+            // Sender allowlist gate — enforced BEFORE the router sees anything
+            // so an unauthorized message burns zero tokens and leaves no trace
+            // in the agent's session log.
+            if (!this.isAllowed(accountId, msg.from?.id, msg.chat?.id, msg.from?.username)) {
+              this.log(
+                `[telegram/${accountId}] dropped message from ${msg.from?.id}${msg.from?.username ? ` (@${msg.from.username})` : ""} in chat ${msg.chat?.id} — not in allowlist`,
+              )
+              continue
+            }
+
+            // Build channel meta for groups (verified bot membership)
+            const isGroup = msg.chat.type !== "private"
+            const groupId = String(msg.chat.id)
+            let channelMeta: ChannelMeta | undefined
+            if (isGroup) {
+              // Seed group membership on first encounter via API
+              if (!this.groupStore.hasGroup(groupId)) {
+                await this.seedGroupMembership(groupId, msg.chat.title)
+              }
+              channelMeta = await this.getChannelMeta(groupId)
+            }
+
+            const incoming: IncomingMessage = {
+              id: String(msg.message_id),
+              channel: "telegram",
+              accountId,
+              sender: {
+                id: String(msg.from.id),
+                name: [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" "),
+                username: msg.from.username,
+                isBot: msg.from.is_bot === true,
+              },
+              group: isGroup
+                ? { id: groupId, name: msg.chat.title || "" }
+                : undefined,
+              text,
+              media: mediaInfo,
+              replyTo: msg.reply_to_message
+                ? String(msg.reply_to_message.message_id)
+                : undefined,
+              replyToText: msg.reply_to_message
+                ? (msg.reply_to_message.text || msg.reply_to_message.caption || `[message from ${msg.reply_to_message.from?.first_name || "unknown"}]`)
+                : undefined,
+              timestamp: new Date(msg.date * 1000),
+              raw: update,
+              channelMeta,
+            }
+
+            // Track chat→account mapping for DM replies
+            this.chatAccountMap.set(String(msg.chat.id), accountId)
+
+            // Shadow log every allowed inbound message — used by seedHistory
+            // on cold session create. Keyed by chat id (DM uses sender.id ==
+            // chat.id; group uses chat.id), matching how the router computes
+            // the SessionStore key (msg.group?.id || msg.sender.id). Off the
+            // hot path: best-effort, never blocks dispatch. accountId records
+            // WHICH of our bots received the message — the audit trail
+            // counterpart to the outbound write.
+            try {
+              this.appendShadowLog(String(msg.chat.id), {
+                externalId: String(msg.message_id),
+                role: "user",
+                name: incoming.sender.name,
+                content: text,
+                timestamp: incoming.timestamp.toISOString(),
+                accountId,
+              })
+            } catch (e: any) {
+              this.log(`shadow-log write failed: ${e.message}`)
+            }
+
+            this.handler(incoming).catch((e) => {
+              this.log(`Error handling message: ${e.message}`)
+            })
+          }
+
+          // Handle bot membership changes (added/removed from group)
+          if (update.my_chat_member) {
+            const mcm = update.my_chat_member
+            const chatId = String(mcm.chat.id)
+            const chatTitle = mcm.chat.title
+            const status = mcm.new_chat_member.status
+            const botUsername = mcm.new_chat_member.user.username || accountId
+
+            this.groupStore.setBotStatus(
+              chatId,
+              chatTitle,
+              accountId,
+              config.agentBinding,
+              botUsername,
+              status,
+            )
+
+            this.log(`Group membership: @${botUsername} is now "${status}" in "${chatTitle || chatId}"`)
+          }
+        }
+        consecutiveErrors = 0
+      } catch (e: any) {
+        consecutiveErrors++
+        const backoff = Math.min(5000 * Math.pow(2, consecutiveErrors - 1), 60000)
+        this.log(`Poll error (${accountId}): ${describeError(e)} [retry in ${backoff / 1000}s, errors: ${consecutiveErrors}]`)
+        await new Promise((r) => setTimeout(r, backoff))
+      }
+    }
+  }
+
+  /**
+   * Get verified context for a Telegram chat.
+   * Reads from persistent group store (fed by my_chat_member events + API seed).
+   */
+  /** Surface chats the adapter has observed, so the workflow editor (or CLI)
+   *  can present a picker when an author is authoring an `action.send` that
+   *  targets a different chat than the trigger's. DMs come from the per-chat
+   *  account map (populated when a user messages a bot); groups come from
+   *  the persistent group membership store. Both lists are small — bounded
+   *  by the number of distinct chats the bots have been in. */
+  listKnownChats(): Array<{ id: string; name?: string; kind: "dm" | "group"; accountId?: string }> {
+    const out: Array<{ id: string; name?: string; kind: "dm" | "group"; accountId?: string }> = []
+    for (const [id, accountId] of this.chatAccountMap) {
+      if (TelegramAdapter.isDirectMessage(id)) {
+        out.push({ id, kind: "dm", accountId })
+      }
+    }
+    for (const g of this.groupStore.listGroups()) {
+      out.push({ id: g.id, name: g.name, kind: "group" })
+    }
+    return out
+  }
+
+  async getChannelMeta(chatId: string): Promise<ChannelMeta | undefined> {
+    const bots = this.groupStore.getGroupBots(chatId)
+    if (!bots.length) return undefined
+
+    return {
+      channel: "telegram",
+      agents: bots.map(b => ({
+        id: b.agentId,
+        name: b.username,
+        handle: `@${b.username}`,
+      })),
+      facts: [`${bots.length} bot(s) verified in this group`],
+    }
+  }
+
+  /**
+   * Seed group membership by querying the Telegram API for each bot.
+   * Called once per group on first encounter, then maintained via my_chat_member events.
+   */
+  private async seedGroupMembership(groupId: string, groupTitle?: string): Promise<void> {
+    this.log(`Seeding group membership for "${groupTitle || groupId}"`)
+
+    for (const [accountId, config] of this.accounts) {
+      const info = this.botInfo.get(accountId)
+      if (!info) continue
+
+      try {
+        const res = await this.apiCall(config.token, "getChatMember", {
+          chat_id: Number(groupId),
+          user_id: info.userId,
+        })
+        const status = res.result?.status
+        if (status) {
+          this.groupStore.setBotStatus(
+            groupId,
+            groupTitle,
+            accountId,
+            config.agentBinding,
+            info.username,
+            status,
+          )
+        }
+      } catch {
+        // Bot not in group or API error — record as "left"
+        this.groupStore.setBotStatus(
+          groupId,
+          groupTitle,
+          accountId,
+          config.agentBinding,
+          info.username,
+          "left",
+        )
+      }
+    }
+
+    this.log(`Seeded: ${this.groupStore.getGroupBots(groupId).length} bot(s) in "${groupTitle || groupId}"`)
+  }
+
+  /** Append one entry to the shadow log for `chatId`. The shadow log is a
+   *  daily file at `.agentx/sessions/_telegram_raw:{chatId}:{day}.json` that
+   *  captures every allowed inbound (and adapter-side outbound) message
+   *  regardless of how the router resolved it — including periods when no
+   *  agent was bound or the daemon was offline (the next inbound triggers
+   *  a write). seedHistory reads it back on cold session create so a fresh
+   *  session mirrors the live chat instead of starting blank. */
+  private appendShadowLog(
+    chatId: string,
+    entry: {
+      externalId: string
+      role: "user" | "agent"
+      name: string
+      content: string
+      timestamp: string
+      /** Telegram bot account id used to send/receive (e.g., "acme_cx_bot").
+       *  Recorded on outbound only — provides the audit trail for "which bot
+       *  actually sent this message" so debugging cross-account confusion
+       *  (the Marketing/CX bug) doesn't require API forensics. */
+      accountId?: string
+    },
+  ): void {
+    const day = entry.timestamp.slice(0, 10) // YYYY-MM-DD
+    const file = this.shadowLogPath(chatId, day)
+    let existing: { messages: typeof entry[] } = { messages: [] }
+    if (existsSync(file)) {
+      try {
+        existing = JSON.parse(readFileSync(file, "utf-8")) as { messages: typeof entry[] }
+        if (!Array.isArray(existing.messages)) existing.messages = []
+      } catch {
+        existing = { messages: [] }
+      }
+    }
+    // Dedup: skip if this externalId is already recorded for the day. Note
+    // that inbound and outbound externalIds CAN collide (Telegram numbers
+    // them per-chat, not per-direction), so we additionally key on role to
+    // avoid the rare case where an inbound `message_id=42` and an outbound
+    // `message_id=42` race on the same day.
+    if (existing.messages.some((m) => m.externalId === entry.externalId && m.role === entry.role)) return
+    existing.messages.push(entry)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, JSON.stringify(existing, null, 2))
+  }
+
+  private shadowLogPath(chatId: string, day: string): string {
+    const safeChatId = chatId.replace(/[^a-zA-Z0-9_-]/g, "_")
+    return resolve(process.cwd(), ".agentx/sessions", `_telegram_raw:${safeChatId}:${day}.json`)
+  }
+
+  /** ChannelAdapter.seedHistory: returns the most recent shadow-logged
+   *  messages for `chatId`, walking back day-by-day until we hit
+   *  `maxMessages` or `maxChars`. Telegram's Bot API has no "fetch chat
+   *  history" endpoint, so the shadow log is our only source — meaning the
+   *  first deployment sees an empty seed for any pre-existing chat, and
+   *  context grows as the bot observes new traffic. */
+  async seedHistory(
+    chatId: string,
+    opts: { sinceISO?: string; maxMessages: number; maxChars: number },
+  ): Promise<SeededMessage[]> {
+    const out: SeededMessage[] = []
+    let chars = 0
+    const today = new Date()
+    // Look back up to 14 days — enough to bridge weekend gaps without
+    // unbounded scanning. The maxMessages/maxChars caps stop us long before
+    // hitting day 14 in any normal chat.
+    const minDate = opts.sinceISO ? new Date(opts.sinceISO) : new Date(today.getTime() - 14 * 86400000)
+    for (let i = 0; i < 14; i++) {
+      const d = new Date(today.getTime() - i * 86400000)
+      if (d.getTime() < minDate.getTime() - 86400000) break
+      const day = d.toISOString().slice(0, 10)
+      const file = this.shadowLogPath(chatId, day)
+      if (!existsSync(file)) continue
+      try {
+        const data = JSON.parse(readFileSync(file, "utf-8")) as {
+          messages?: Array<{ externalId: string; role: "user" | "agent"; name: string; content: string; timestamp: string; accountId?: string }>
+        }
+        const msgs = (data.messages ?? []).slice() // newest within the file
+        // Files are append-only in chronological order, so reverse to walk
+        // newest-first per day (matches our outer newest-first loop).
+        for (let j = msgs.length - 1; j >= 0; j--) {
+          const m = msgs[j]
+          if (opts.sinceISO && m.timestamp < opts.sinceISO) continue
+          out.push({
+            role: m.role,
+            name: m.name,
+            content: m.content,
+            timestamp: m.timestamp,
+            externalId: m.externalId,
+            accountId: m.accountId,
+          })
+          chars += m.content.length
+          if (out.length >= opts.maxMessages) break
+          if (chars >= opts.maxChars) break
+        }
+      } catch {
+        // Skip corrupt shadow files silently — they self-heal on next write.
+      }
+      if (out.length >= opts.maxMessages || chars >= opts.maxChars) break
+    }
+    // Caller wants oldest-first for buildHistoryContext rendering.
+    return out.reverse()
+  }
+
+  private async apiCall(
+    token: string,
+    method: string,
+    params?: Record<string, unknown>,
+  ): Promise<any> {
+    const url = `https://api.telegram.org/bot${token}/${method}`
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: params ? JSON.stringify(params) : undefined,
+    })
+
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(`Telegram API error: ${res.status} ${text}`)
+    }
+
+    return res.json()
+  }
+
+  /** Multipart upload of a local file (sendPhoto/sendDocument/...). */
+  private async apiUpload(
+    token: string,
+    method: string,
+    chatId: string,
+    field: string,
+    filePath: string,
+    caption?: string,
+    replyTo?: string,
+  ): Promise<any> {
+    const data = readFileSync(filePath)
+    const name = basename(filePath)
+    const mime = MIME_BY_EXT[extname(filePath).toLowerCase()] || "application/octet-stream"
+    const form = new FormData()
+    form.append("chat_id", chatId)
+    if (caption) form.append("caption", caption.slice(0, 1024))
+    if (replyTo) form.append("reply_to_message_id", String(parseInt(replyTo, 10)))
+    form.append(field, new Blob([data], { type: mime }), name)
+    const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, { method: "POST", body: form })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(`Telegram API error: ${res.status} ${text}`)
+    }
+    return res.json()
+  }
+}

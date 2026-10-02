@@ -1,0 +1,222 @@
+import { z } from "zod"
+
+// --- Provider abstraction ---
+
+export interface GenerationMessage {
+  role: "user" | "assistant" | "system"
+  content: string
+}
+
+export interface GenerationResult {
+  content: string
+  files: GeneratedFile[]
+  followUp?: string // Agent may ask for more info
+  tokensUsed?: number
+}
+
+export interface GeneratedFile {
+  path: string
+  content: string
+  language?: string
+  description?: string
+}
+
+export interface ProviderOptions {
+  model?: string
+  maxTokens?: number
+  temperature?: number
+  apiKey?: string
+  /** Operator-cancel signal — passed straight to fetch() so the in-
+   *  flight HTTP request to the provider can be closed when the
+   *  task is cancelled. Without this, /api/tasks/:id/cancel only
+   *  marks the task aborted in the registry; the underlying request
+   *  can hang for hours waiting for the model to finish thinking. */
+  abortSignal?: AbortSignal
+  /** Plain text generation only: no tools, no MCP servers, no hooks, no
+   *  user/project settings, no session persistence. Helper calls
+   *  (classifier, summaries, extraction) set this so a CLI-backed provider
+   *  skips the full interactive startup instead of paying it per call. */
+  bare?: boolean
+  /** Force the model to call one specific tool, making its whole reply the
+   *  tool's structured `input`. Anthropic renders this as
+   *  `tool_choice: {type:"tool", name}`; OpenAI as
+   *  `tool_choice: {type:"function", function:{name}}`. Providers that
+   *  can't force a tool (the claude-code CLI on OAuth) ignore it — callers
+   *  must check `PROVIDER_CAPABILITIES[name].structuredOutput` first. */
+  toolChoice?: { type: "tool"; name: string }
+  /** OpenAI-compatible structured-output passthrough. Anthropic ignores it;
+   *  use `toolChoice` there instead. */
+  responseFormat?: {
+    type: "json_schema"
+    name: string
+    schema: Record<string, unknown>
+  }
+  /** Ask for the token distribution behind the answer. Only meaningful on
+   *  OpenAI-compatible providers, and only useful when the answer is a
+   *  single token — see src/decisions/backends/local-llm.ts, which is the
+   *  one caller that has a use for it. */
+  logprobs?: { enabled: true; topK: number }
+}
+
+export type StreamEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "tool_use_start"; name: string; id: string }
+  | { type: "tool_use_delta"; json: string }
+  | { type: "tool_use_end"; name: string }
+  // Internal reasoning chunk from a thinking-mode model (DeepSeek V4
+  // `reasoning_content`, OpenAI o-series, …). Consumers can render
+  // these inline as the agent thinks; runtime.ts forwards them with
+  // a `💭 ` marker so the live dashboard modal's existing thought-
+  // event renderer picks them up automatically.
+  | { type: "thinking_delta"; text: string }
+  | { type: "done"; result: GenerationResult }
+  | { type: "error"; error: string }
+
+// --- Raw (agentic) API types ---
+
+export interface AnthropicMessage {
+  role: "user" | "assistant"
+  content: string | ContentBlock[]
+}
+
+export type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+  | { type: "tool_result"; tool_use_id: string; content: string; is_error?: boolean }
+  // Internal-thinking output from "reasoning" models (DeepSeek V4
+  // `reasoning_content`, OpenAI o-series, etc.). Not surfaced to end
+  // users; the agentic loop keeps it on the assistant turn so the
+  // round-trip to the next iteration carries it back — required by
+  // DeepSeek V4 which otherwise errors "reasoning_content in the
+  // thinking mode must be passed back to the API". Non-reasoning
+  // providers ignore this block type.
+  | { type: "reasoning"; text: string }
+
+export interface RawGenerationResult {
+  content: ContentBlock[]
+  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence"
+  usage: { input_tokens: number; output_tokens: number }
+}
+
+export interface AgentProvider {
+  name: string
+  generate(
+    messages: GenerationMessage[],
+    options?: ProviderOptions
+  ): Promise<GenerationResult>
+  stream?(
+    messages: GenerationMessage[],
+    options?: ProviderOptions
+  ): AsyncIterable<StreamEvent>
+  /** Low-level method returning raw content blocks for the agentic tool_result loop */
+  generateRaw?(
+    messages: AnthropicMessage[],
+    systemPrompt: string,
+    tools: Array<{ name: string; description: string; input_schema: Record<string, unknown> }>,
+    options?: ProviderOptions
+  ): Promise<RawGenerationResult>
+  /**
+   * Streaming variant of generateRaw — emits text_delta events as the
+   * model generates so callers can pipe per-token to UIs (voice TTS,
+   * SSE, etc.) AND still get the full RawGenerationResult at the end
+   * with the tool_use blocks intact, so the agentic loop's tool
+   * dispatch keeps working unchanged. Optional — runAgenticLoop falls
+   * back to generateRaw() when this isn't implemented.
+   */
+  generateRawStream?(
+    messages: AnthropicMessage[],
+    systemPrompt: string,
+    tools: Array<{ name: string; description: string; input_schema: Record<string, unknown> }>,
+    options?: ProviderOptions
+  ): AsyncIterable<RawStreamEvent>
+}
+
+/**
+ * Event stream from generateRawStream. text_delta arrives per chunk so
+ * the caller can stream to a UI; tool_use blocks accumulate silently and
+ * are surfaced in the terminal raw_result event so the agentic loop's
+ * tool dispatch logic stays unchanged.
+ */
+export type RawStreamEvent =
+  | { type: "text_delta"; text: string }
+  // Reasoning chunk from a thinking-mode model. Emitted alongside
+  // text_delta events as the model thinks; the final raw_result also
+  // carries a `reasoning` content block so the agentic loop's
+  // round-trip continues to satisfy DeepSeek's "must echo back" rule.
+  | { type: "thinking_delta"; text: string }
+  | { type: "raw_result"; result: RawGenerationResult }
+  | { type: "error"; error: string }
+
+// --- Agent configuration ---
+
+export const agentConfigSchema = z.object({
+  provider: z.enum(["claude-code", "claude", "openai", "deepseek", "ollama", "demo", "custom"]).default("claude-code"),
+  model: z.string().optional(),
+  apiKey: z.string().optional(),
+  skills: z.array(z.string()).default([]),
+  output: z
+    .object({
+      dir: z.string().default("./generated"),
+    })
+    .default({}),
+  context7: z
+    .object({
+      enabled: z.boolean().default(true),
+      apiKey: z.string().optional(),
+    })
+    .default({}),
+  agentic: z
+    .object({
+      maxIterations: z.number().default(20),
+      enabledTools: z.array(z.string()).default([
+        "create_files", "ask_user", "read_file",
+        "search_files", "list_directory", "run_command", "edit_file",
+      ]),
+      disabledTools: z.array(z.string()).default([]),
+    })
+    .default({}),
+})
+
+export type AgentConfig = z.infer<typeof agentConfigSchema>
+
+// --- Output types ---
+
+export const OUTPUT_TYPES = [
+  "component",
+  "page",
+  "api",
+  "website",
+  "document",
+  "script",
+  "config",
+  "skill",
+  "media",
+  "report",
+  "test",
+  "workflow",
+  "schema",
+  "email",
+  "diagram",
+  "auto",
+] as const
+
+export type OutputType = (typeof OUTPUT_TYPES)[number]
+
+export const outputTypeDescriptions: Record<OutputType, string> = {
+  component: "UI component (any framework)",
+  page: "Full page or screen",
+  api: "API endpoint, route handler, or service",
+  website: "Multi-page website or app",
+  document: "Markdown, documentation, or specification",
+  script: "Standalone script or utility",
+  config: "Configuration file or setup",
+  skill: "Agent skill (SKILL.md format for skills.sh)",
+  media: "Media generation prompt (image/audio/video description)",
+  report: "Analysis report or audit",
+  test: "Test suite, test fixtures, or test data",
+  workflow: "CI/CD pipeline, GitHub Actions, or automation",
+  schema: "Database schema, Zod validators, or GraphQL types",
+  email: "Email template (React Email, MJML, HTML)",
+  diagram: "Mermaid, D2, or PlantUML diagram",
+  auto: "Auto-detect the best output type",
+}

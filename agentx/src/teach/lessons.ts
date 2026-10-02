@@ -1,0 +1,263 @@
+// Lessons for `agentx teach`.
+//
+// A lesson is a sequence of things to SAY, each optionally paired with
+// something to POINT AT. The narration is written to be heard, not read:
+// short sentences, no jargon before it is explained, and no URLs — the
+// same constraints the voice path has everywhere else.
+//
+// `find` is a description, not a selector. It goes to the ui-element seat,
+// which picks from what is actually on screen — so a lesson keeps working
+// when a site moves its buttons, and fails honestly when the screen is not
+// where it expected rather than pointing confidently at the wrong thing.
+
+export interface LessonStep {
+  /** Spoken aloud, printed, and shown in the on-screen callout. */
+  say: string
+  /** Required readiness claim, checked before each action. */
+  before?: string
+  /** What to point at, in plain words. Omit for narration only. */
+  find?: string
+  /** Overrides the label shown on the highlight pill. */
+  label?: string
+  /** Click the located element. Requires `find`. */
+  click?: boolean
+  /** Type this after locating (and clicking) — paced like a hand. */
+  type?: string
+  /** Press a named key afterwards, e.g. "return" to submit. Separate from
+   *  `type` so committing a form is always its own deliberate step. */
+  key?: string
+  holdSeconds?: number
+  /** Pause after a click, for pages that navigate. */
+  afterClickWaitMs?: number
+  /**
+   * A claim that must be TRUE once this step has run, checked by looking
+   * at the screen.
+   *
+   * This exists because every other check in a lesson confirms that a call
+   * returned, not that anything happened. A run once narrated a whole
+   * recording session that never started, and nothing in the pipeline
+   * disagreed. A step that claims an effect should state it here, and the
+   * lesson stops when the claim is refuted OR cannot be settled — an
+   * inconclusive look is not a pass.
+   *
+   * Write claims about things plainly visible: text in a field, a page
+   * that has loaded, a panel covering something. Not about small status
+   * glyphs — a menu bar recording dot is about six points, and the vision
+   * models tested both missed a real one and reported one that was not
+   * there. See seats/screen-state.ts for the measurements.
+   */
+  verify?: string
+  /** Log the check but keep going when it fails. For claims worth
+   *  recording that are not worth stopping over. */
+  verifyOptional?: boolean
+}
+
+export interface Lesson {
+  id: string
+  title: string
+  /** What should be on screen before starting. */
+  appHint: string
+  /** `cleanWindow`: open a throwaway Chrome profile in app mode (Chrome only). */
+  start?: { app: string; url: string; ready: string; cleanWindow?: boolean }
+  steps: LessonStep[]
+}
+
+/**
+ * X advanced search operators.
+ *
+ * Chosen because the gap between what people do and what is possible is
+ * unusually wide here. Almost everyone types words into the search box and
+ * scrolls. Almost nobody knows the box accepts operators — and one of them,
+ * min_faves, turns the search into "show me this person's best work", which
+ * is the thing people actually want and have no other way to get.
+ */
+const xAdvancedSearch: Lesson = {
+  id: "x-advanced-search",
+  title: "X search: find anyone's best posts",
+  appHint: "Opens X in Chrome; sign in before running the lesson.",
+  start: { app: "Google Chrome", url: "https://x.com/home", ready: "Google Chrome is frontmost showing the signed-in x.com home page with its navigation sidebar" },
+  steps: [
+    {
+      say: "Here's something about X search that almost nobody uses. It takes ten seconds and it changes what the site is good for.",
+    },
+    {
+      say: "Let's open search. This is it in the sidebar.",
+      find: "the search and explore link in the sidebar",
+      label: "Search",
+      before: "Google Chrome is frontmost showing signed-in x.com with the search and explore sidebar link visible",
+      click: true,
+      // x.com navigates here; the input only exists on the page that loads.
+      afterClickWaitMs: 2600,
+    },
+    {
+      say: "Here's the box itself. Most people type a few words here and scroll. But it accepts commands, not just words.",
+      find: "the search query input field where you type",
+      label: "search field",
+      before: "Google Chrome is frontmost showing x.com with the search query input visible",
+      click: true,
+      afterClickWaitMs: 900,
+    },
+    {
+      // One `type`, not two.
+      //
+      // Split across two steps, only the second survived: x.com is a SPA
+      // and its search field re-rendered between them, discarding the
+      // first. The take showed q=min_faves:500 with "from:naval" gone and
+      // an error on the results page. Any field with autocomplete or
+      // controlled state can do this, so a single query goes in a single
+      // call and the narration carries the explanation instead.
+      say: "Watch. From colon, then a username, limits it to that person. Then min underscore faves, colon, five hundred — only posts with at least five hundred likes.",
+      before: "Google Chrome is frontmost on x.com and the empty search query input has keyboard focus",
+      type: "from:naval min_faves:500",
+      holdSeconds: 1.8,
+    },
+    {
+      say: "And submit.",
+      before: "Google Chrome is frontmost on x.com and the focused search input contains from:naval min_faves:500",
+      key: "return",
+      holdSeconds: 3.2,
+      // The one claim in this lesson worth checking: the query actually
+      // reached the page. It is a text question about a loaded page, which
+      // is what looking at the screen is reliable for.
+      // Worded to avoid "X search results", which reads two ways: X is the
+      // site, but a model sees "X results" as a placeholder for a number
+      // and goes looking for a result count that x.com does not display.
+      // Measured: the observation came back correct and the evidence
+      // argued against it, landing the claim at 0.07. A claim is only as
+      // good as its least ambiguous reading.
+      verify: "the x.com page is displaying search results for the query from:naval min_faves:500, with at least one post visible",
+    },
+    {
+      say: "There it is. That person's greatest hits — everything they wrote that actually landed. No scrolling through years of replies.",
+      holdSeconds: 2,
+    },
+    {
+      say: "Two more that pair well with it. Until colon, and since colon, with a date, pin it to a time period. Useful when you half remember something from a particular month.",
+    },
+    {
+      say: "And filter colon links, or filter colon media, narrows it to posts that shared something, which is usually where the substance is.",
+    },
+    {
+      say: "After you search, check the Latest tab. Top is ranked, Latest is chronological, and for research you almost always want chronological.",
+      find: "the Latest tab",
+      label: "Latest",
+    },
+    {
+      say: "That's it. From colon someone, min underscore faves colon five hundred. It works on your own account too, which is a quick way to see what people actually responded to.",
+    },
+  ],
+}
+
+/**
+ * Bookmark folders. Shipped quietly, still largely unknown, and the
+ * closest thing X has to a research tool.
+ */
+const xBookmarkFolders: Lesson = {
+  id: "x-bookmark-folders",
+  title: "X bookmarks: turn the pile into folders",
+  appHint: "Opens X in Chrome; sign in before running the lesson.",
+  start: { app: "Google Chrome", url: "https://x.com/home", ready: "Google Chrome is frontmost showing the signed-in x.com home page with its navigation sidebar" },
+  steps: [
+    {
+      say: "Most people's bookmarks on X are a single pile they never open again. There's a fix that takes a minute.",
+    },
+    {
+      say: "Bookmarks live here in the sidebar. By default everything you save lands in one list, in the order you saved it.",
+      find: "the Bookmarks link in the sidebar",
+      label: "Bookmarks",
+      before: "Google Chrome is frontmost showing signed-in x.com with the Bookmarks sidebar link visible",
+      click: true,
+      verify: "Google Chrome is showing the x.com Bookmarks page",
+    },
+    {
+      say: "But bookmarks support folders. Open bookmarks and look for the add folder control, usually a small plus at the top right.",
+      find: "the add folder button",
+      label: "new folder",
+    },
+    {
+      say: "The trick is what you name them. Not topics like design or tech, which you'll never search for. Name them after decisions you're going to make, like hiring, or pricing.",
+      holdSeconds: 2,
+    },
+    {
+      say: "Then when you save a post, hold the bookmark button instead of tapping it, and it asks which folder. That one gesture is the whole difference between a pile and a library.",
+    },
+  ],
+}
+
+/**
+ * A tour of the AgentX dashboard, staged on the Docker demo
+ * (docker-compose.demo.yml). It only points and clicks navigation, so a
+ * recording of it never changes the demo's state.
+ */
+const agentxDashboardTour: Lesson = {
+  id: "agentx-dashboard-tour",
+  title: "AgentX: a tour of your agent team",
+  appHint: "Start the demo first: docker compose -f docker-compose.demo.yml up -d",
+  start: {
+    app: "Google Chrome",
+    url: "http://127.0.0.1:18931/live",
+    cleanWindow: true,
+    ready: "The text laptop-paris is visible on the page",
+  },
+  steps: [
+    {
+      say: "This is AgentX: a team of AI agents running on your own machines. Everything here is real, except the model's replies, which are scripted for the demo.",
+    },
+    {
+      say: "Up top, three machines, one agent each, all online.",
+      find: "the 3/3 machines count under Agents online",
+      label: "3 machines online",
+    },
+    {
+      say: "This machine is a laptop in Paris. Its agent, CX, talks to customers, and hands technical work to others.",
+      find: "the laptop-paris machine name",
+      label: "CX · laptop-paris",
+    },
+    {
+      say: "And this is Builder, on a server in New York. When CX gets a code problem, it sends it here, across the mesh.",
+      find: "the @builder Builder agent name in the vps-nyc section",
+      label: "Builder · vps-nyc",
+    },
+    {
+      say: "Operations shows what the whole team actually did.",
+      find: "the Operations tab in the top navigation bar",
+      label: "Operations",
+      before: "The AgentX Live page is on screen with the Live tab selected",
+      click: true,
+      verify: "The page shows the heading Mesh operations",
+    },
+    {
+      say: "Machines online, work in progress, failures today, and jobs waiting for a person to review.",
+      find: "the Nodes online summary",
+      label: "The team at a glance",
+    },
+    {
+      say: "Each lane is one kind of work. The demo's run landed here, as direct tasks.",
+      find: "the Direct lane label in the What ran chart",
+      label: "Direct tasks",
+    },
+    {
+      say: "Workflows turn a job you repeat into steps you can review before they run.",
+      find: "the Workflows tab in the top navigation bar",
+      label: "Workflows",
+      before: "The AgentX page with the heading Mesh operations is on screen",
+      click: true,
+      verify: "The page shows a Workflows list that includes Draft the demo shop report",
+    },
+    {
+      say: "This one drafts a report for the demo shop. It's saved switched off, so nothing runs until you say so.",
+      find: "the Draft the demo shop report workflow title",
+      label: "A saved workflow",
+    },
+    {
+      say: "And on every page, you can ask an agent about what you're looking at.",
+      find: "the Ask an agent about this page input",
+      label: "Ask an agent",
+    },
+    {
+      say: "That's the tour. Your machines, the work they did, and the jobs you can hand them.",
+    },
+  ],
+}
+
+export const LESSONS: Lesson[] = [xAdvancedSearch, xBookmarkFolders, agentxDashboardTour]

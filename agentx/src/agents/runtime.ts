@@ -1,0 +1,2238 @@
+import { openCodeProcessPool, OpenCodeServerUnavailable } from "./opencode-process"
+import { execa } from "execa"
+import { codexProcessPool, CodexUnavailable } from "./codex-process"
+import { execFile, spawn } from "child_process"
+import { StringDecoder } from "string_decoder"
+import { mkdtempSync, readFileSync, rmSync } from "fs"
+import { join } from "path"
+import { tmpdir } from "os"
+import { friendlyModelError, renderFriendlyError, type FriendlyError } from "./error-map"
+
+/** An exit 143 this close to the time limit is the limit's own SIGTERM. */
+const SIGTERM_TIMEOUT_SLACK_MS = 5_000
+
+/** Small helper: render a raw error string into both the operator-facing
+ *  one-line message and the typed kind discriminator. Call sites that hit
+ *  `renderFriendlyError(friendlyModelError(...))` should use this so the
+ *  kind survives onto the response (see AgentResponse.errorKind). */
+function buildErrorEnvelope(raw: string | undefined | null): { error: string; errorKind: FriendlyError["kind"] } {
+  const friendly = friendlyModelError(raw)
+  if (friendly.kind === "invalid_request" || friendly.kind === "unknown") {
+    const sample = (raw || "").replace(/\s+/g, " ").slice(0, 800)
+    if (sample) process.stderr.write(`[agentx][model-error][${friendly.kind}] raw=${sample}\n`)
+  }
+  return { error: renderFriendlyError(friendly), errorKind: friendly.kind }
+}
+import { buildAgentEnv, claudeBillingEnv } from "@/utils/workspace-env"
+import type { AgentDef } from "@/daemon/config"
+import { ALL_TOOL_NAMES } from "@/agent/tools"
+import type { SeededMessage } from "@/channels/types"
+import { getProcessRegistry } from "./process-registry-instance"
+import { RegistryCapExceeded, type ProcessKey } from "./process-registry"
+import { TurnDeadlineExceeded, TurnInterrupted } from "./claude-process-factory"
+import { effectiveMcpConfig } from "./codegraph-bootstrap"
+import { autonomyBrief, isRestricted, type AutonomyLevel } from "@/guard/autonomy"
+import { autonomyClaudeArgs, autonomyUnsupported, takeAutonomyBlocks, type AutonomyBlock } from "@/guard/autonomy-enforce"
+import { globalPermissions, type PermissionMode } from "@/permissions"
+import { PERMISSION_MODES } from "@/permissions/types"
+
+// --- Agent execution runtime ---
+// Routes agent tasks to the correct execution tier:
+// - claude-code: spawns claude CLI (subscription, full features)
+// - codex-cli: spawns codex CLI (OpenAI Codex, full CLI agent)
+// - opencode: spawns OpenCode CLI (uses the operator's configured providers)
+// - sdk: uses Claude Agent SDK (API key, programmatic)
+// - orchestrator: uses agentx's own agentic loop (any provider)
+
+/** Message shown to operators when the `claude` CLI isn't on PATH. Hits both
+ *  the streaming and non-streaming paths — without this we used to surface
+ *  "Claude Code exited with code unknown" / "code ENOENT", neither of which
+ *  hints at the actual fix. */
+function claudeMissingMessage(): string {
+  return (
+    `Claude Code CLI not found on PATH. Install it before starting an agent: ` +
+    `https://docs.claude.com/en/docs/claude-code . On Linux/macOS:  npm i -g @anthropic-ai/claude-code  ` +
+    `then verify with  claude --version. If you don't intend to use the claude-code engine, set the agent's tier to "sdk" or "orchestrator" in agentx.json.`
+  )
+}
+
+function codexMissingMessage(): string {
+  return (
+    `Codex CLI not found on PATH. Install it before starting an agent: ` +
+    `npm i -g @openai/codex then verify with  codex --version. ` +
+    `If you don't intend to use the codex-cli engine, set the agent's tier to "claude-code", "sdk", or "orchestrator" in agentx.json.`
+  )
+}
+
+function openCodeMissingMessage(): string {
+  return (
+    `OpenCode CLI not found on PATH. Install it from https://opencode.ai/docs/ and verify with  opencode --version. ` +
+    `If you don't intend to use the opencode engine, set the agent's tier to "claude-code", "codex-cli", "sdk", or "orchestrator" in agentx.json.`
+  )
+}
+
+export interface AgentPeer {
+  id: string
+  name: string
+  handle?: string       // e.g. "@my_bot"
+  role?: string         // from systemPrompt, first line
+}
+
+export interface AgentTask {
+  message: string
+  agentId: string
+  /** Set by the queue flush: when this message was first queued. The run
+   *  prepends the stale-state note from it when it starts, and a flushed
+   *  message that has to queue again keeps it, so the note is added once
+   *  and reports the whole wait (#282). */
+  queuedAt?: number
+  /** Correlator threaded by the workflow engine. When the engine dispatches
+   *  an agent as part of a state transition, this carries the run id so
+   *  post:response can re-enter the engine with an agentResult condition. */
+  workflowRunId?: string
+  /** Per-invocation model override (e.g. cron model). Falls back to agent.model. */
+  model?: string
+  /** Cacheable text delivered to Claude via --append-system-prompt. Typically
+   *  agent.systemPrompt + SOUL/IDENTITY/AGENTS.md. Passing stable content
+   *  here (instead of in the user-message body) keeps it inside Claude's
+   *  cached system prompt across session resumes. */
+  systemPromptAppend?: string
+  /** Per-invocation override for the context assembly strategy. When unset,
+   *  the registry falls back to config.session.contextStrategy. Set this
+   *  from benchmark harnesses that want to A/B the same request under
+   *  "layered" and "planner" without reloading daemon config. */
+  contextStrategy?: "layered" | "planner"
+  /** Upper bound on how long this task may run. Applied to mesh
+   *  forwarding (as fetch timeout) and local execution when the runtime
+   *  supports it. Workflow `agent` nodes pass this through from their
+   *  config.timeoutMinutes. */
+  timeoutMinutes?: number
+  /** Phase 1 / 6 — when set, identifies the intent-ledger decision row
+   *  this task corresponds to. The registry records a resolution row
+   *  on this decision when the task completes (success / error / mesh-
+   *  fallback). Active-task safety in `decideAndCommit` reads
+   *  intent_resolutions to clear in-flight slots; without resolution
+   *  writes, every dispatched decision sits in-flight forever and
+   *  Inv-ActiveTaskSafety becomes vacuously over-aggressive. Channel
+   *  adapters (gitlab, router) set this when their record*Dispatch
+   *  helper returns a dispatched decision. */
+  intentRef?: {
+    eventId: string
+    decidedBy: string
+  }
+  /** ULID for the per-execution trace row in task_traces (improvement
+   *  plan #2). Allocated by registry.execute right before emitting the
+   *  task:started bus event so per-step capture sites in the streaming
+   *  parser can append rows under the same id. Optional — when unset,
+   *  step capture is a no-op. */
+  taskId?: string
+  /** The id the dashboard knows this run by (RunningTask.id — live stream,
+   *  cancel, follow-up, persisted TaskRecord). Set by registry.execute once
+   *  the run holds a slot; distinct from `taskId`, which is the trace id.
+   *  Callers that dispatch without an HTTP stream (cron) read it back to
+   *  link the run to the Task page. */
+  runningTaskId?: string
+  /** Called with `runningTaskId` as soon as the run starts. Never fires for
+   *  a message that was queued or dropped instead of run. */
+  onStart?: (runningTaskId: string) => void
+  /** How to re-enter this run if a restart cuts it off (agents/resume).
+   *  Absent: recorded as a direct run with this task's context. */
+  origin?: import("./resume/origin").RunOrigin
+  /** Set on a run that resumes one cut off by a restart. */
+  resumeAttempt?: number
+  resumedFrom?: string
+  /** Set on the one automatic retry of a run whose preparation steps hit
+   *  the pre-spawn deadline (#340). A retry that hits it again is reported. */
+  preSpawnRetry?: number
+  /** Improvement plan #8 — when true, the dispatcher discards any
+   *  cached session for this (agent, channel, chatId) before
+   *  executing: the claudeSessionId is cleared (no --resume) and
+   *  any persistent-process handle is killed so the next dispatch
+   *  spawns fresh. Use from triage→sub-agent delegation paths where
+   *  the caller knows this is a NEW visitor on a chatId that may
+   *  collide with prior conversations.
+   *
+   *  Caught in benchmark Run 3 (2026-05-04): a triage agent
+   *  delegated to "lead" for a brand-new visitor; lead's warm
+   *  persistent process replied with the previous visitor's
+   *  confirmation message. freshSession: true defends against
+   *  that pattern without requiring callers to invent unique
+   *  chatIds. */
+  freshSession?: boolean
+  /** Transcript held by a client that owns the conversation (OpenCode).
+   *  Seeds an empty AgentX session the same way a channel adapter's
+   *  seedHistory does, so a new or rotated session starts with it. */
+  seedHistory?: SeededMessage[]
+  /** Routine autonomy level (cron job / workflow agent step). `report` and
+   *  `propose` are enforced for THIS task only via a per-spawn guard hook
+   *  (see guard/autonomy-enforce.ts); unset or `act` = the agent's normal
+   *  permissions. Tiers that cannot enforce it refuse the task. */
+  autonomy?: AutonomyLevel
+  context?: {
+    channel?: string
+    sender?: string
+    /** Platform user ID (e.g. Telegram user ID) */
+    senderId?: string
+    /** Platform username (e.g. @username) */
+    senderUsername?: string
+    group?: string
+    /** Stable chat ID for session keying (e.g. "project:issue:123" for GitLab) */
+    chatId?: string
+    /** Attached media file (image, audio, video, document) */
+    mediaPath?: string
+    mediaType?: string
+    /** Text of the message being replied to */
+    replyToText?: string
+    conversationHistory?: Array<{ role: string; content: string }>
+    /** This agent's own handle on the current channel */
+    myHandle?: string
+    /** Other available agents and their handles */
+    peers?: AgentPeer[]
+    /** Verified channel metadata (from adapter) */
+    channelMeta?: {
+      agents?: Array<{ id: string; name: string; handle?: string }>
+      project?: string
+      issue?: { type: string; iid: string; title: string }
+      facts?: string[]
+    }
+    /** Path to the project root whose runbook (CLAUDE.md / AGENTS.md / etc.)
+     *  should be injected into the agent's system prefix for this task.
+     *  Set by the gitlab/github adapters when a project rule resolves a
+     *  `runbook:` path. Optional. */
+    runbookPath?: string
+    /** Override list of files to read from runbookPath. Optional. */
+    runbookFiles?: string[]
+    /** Root of an agent-to-agent chain (a2a/initiator.ts). Set on every
+     *  delegated hop, forwarded across mesh peers with the context. */
+    initiator?: import("@/a2a/initiator").RootInitiator
+    /** Set on a callback turn: the delegation whose result it carries. */
+    delegation?: { taskId: string; from: string; peer?: string; status: string }
+  }
+}
+
+export interface AgentResponse {
+  content: string
+  error?: string
+  /** Typed discriminator on `error`. Lets dispatchers and workflow nodes
+   *  branch on the failure cause without string-matching the friendly
+   *  message (which is operator-facing prose, not machine input). The
+   *  full FriendlyError taxonomy is in error-map.ts; common ones to
+   *  branch on: `out_of_credits`, `rate_limit`, `auth`, `timeout`. */
+  errorKind?: FriendlyError["kind"]
+  tokensUsed?: number
+  duration?: number
+  claudeSessionId?: string
+  codexSessionId?: string
+  opencodeSessionId?: string
+  usage?: TokenUsage  // Real token counts from Claude's JSON output
+  /** End-of-turn context size: the LAST API call's (input + cacheRead +
+   *  cacheCreate) inside this turn, captured from the final assistant
+   *  stream event. `usage` above is CUMULATIVE across every call in the
+   *  agentic loop (a tool-heavy turn easily sums to millions via cache
+   *  reads) — only this field reflects how full the conversation context
+   *  actually is, so rotation decisions must use it, never `usage`.
+   *  Undefined on non-streaming paths (result JSON has no per-call data). */
+  contextTokens?: number
+  /** Agentic-loop iterations the provider took inside THIS user turn, from
+   *  the CLI result event's `num_turns`. Distinct from a conversation turn:
+   *  one user message can cost many of these when the agent chains tools.
+   *  Benchmarks need it to tell "JEV made the agent cheaper" apart from
+   *  "JEV made the agent do less work". Undefined when the provider does
+   *  not report it. */
+  numTurns?: number
+  /** The model Claude actually billed for (from the CLI's init event). When
+   *  absent, cost reporting should fall back to the model override / agent
+   *  config. Knowing the billed model is what makes cache-aware pricing
+   *  trustworthy — a task that ran sonnet but was logged as opus would
+   *  overstate cost by ~5×. */
+  billedModel?: string
+  /** Set when the task was forwarded to a mesh peer that hosted the
+   *  requested agent (the local registry didn't have it). Name of the
+   *  peer that actually ran it. */
+  viaMesh?: string
+  /** Set when a live Claude Code session attached to this identity answered
+   *  the task instead of a spawned provider (attach mode). Claude Code
+   *  session id of the terminal that wrote the reply. */
+  viaAttachedSession?: string
+  /** Set on tasks that ran under a restricted autonomy level. */
+  autonomy?: AutonomyLevel
+  /** Tool calls the autonomy guard blocked during this task — what the
+   *  routine would have done with more power. */
+  autonomyBlocks?: AutonomyBlock[]
+}
+
+/** Callback for streaming text deltas */
+export type StreamCallback = (delta: string, fullText: string) => void
+
+/**
+ * Build the prompt from agent config + task context + conversation history.
+ */
+function buildPrompt(agent: AgentDef, task: AgentTask, historyContext?: string): string {
+  const parts: string[] = []
+
+  // NOTE: agent.systemPrompt is no longer injected into the user-message body —
+  // it's now delivered via `--append-system-prompt` so Claude's prompt cache
+  // retains it across turns instead of us paying cache-create for it on every
+  // new session. If a per-task override is needed, use task.context.systemPrompt
+  // (which buildClaudeArgs also forwards to --append-system-prompt).
+
+  // Inject environment context — skip if historyContext is provided (context engine handles it)
+  if (task.context && !historyContext) {
+    const ctx = task.context
+    const envLines: string[] = ["", "[Environment]"]
+    const isGitLab = ctx.channel === "gitlab" || ctx.channel?.startsWith("webhook:")
+    const isTelegram = ctx.channel === "telegram"
+
+    if (ctx.channel) envLines.push(`Channel: ${ctx.channel}`)
+    if (ctx.group) envLines.push(`Group: ${ctx.group}`)
+    if (ctx.sender) envLines.push(`Message from: ${ctx.sender}`)
+    if (ctx.myHandle) envLines.push(`Your handle on this channel: ${ctx.myHandle}`)
+
+    if (isGitLab) {
+      envLines.push("")
+      envLines.push("[IMPORTANT: You are responding to a GitLab comment/event]")
+      envLines.push("- Keep it short — 3-5 lines for the main message. Humans scan, not read")
+      envLines.push("- Lead with the result or action, not a narration of what you plan to do")
+      envLines.push("- Use <details><summary>Details</summary>\\n\\ncontent\\n</details> for verbose output (logs, full commands, step-by-step)")
+      envLines.push("- Do NOT mention Telegram handles — they don't work on GitLab")
+      envLines.push("- Do NOT try to delegate to other agents — reply directly")
+      envLines.push("- Reference issues with #IID and MRs with !IID")
+    }
+
+    if (isTelegram && ctx.peers?.length) {
+      envLines.push("")
+      envLines.push("[Team — other agents you can mention to delegate or collaborate]")
+      for (const peer of ctx.peers) {
+        const handle = peer.handle ? ` (mention: ${peer.handle})` : ""
+        const role = peer.role ? ` — ${peer.role}` : ""
+        envLines.push(`• ${peer.name}${handle}${role}`)
+      }
+      envLines.push("")
+      envLines.push("To involve another agent, mention their handle in your response and they will automatically see it and reply.")
+    }
+
+    parts.push(envLines.join("\n"))
+  }
+
+  // Reply-to context (when user replies to a specific message)
+  if (task.context?.replyToText) {
+    parts.push("")
+    parts.push(`[Replying to]: ${task.context.replyToText}`)
+  }
+
+  // Attached media
+  if (task.context?.mediaPath) {
+    parts.push("")
+    parts.push(`[Attached file: ${task.context.mediaPath}]`)
+    parts.push(`[File type: ${task.context.mediaType || "unknown"}]`)
+    if (task.context.mediaType?.startsWith("image/")) {
+      parts.push("Please read/view this image file and describe or respond to it.")
+    } else if (task.context.mediaType?.startsWith("audio/")) {
+      parts.push("Please transcribe this audio file and respond to its content.")
+    } else if (task.context.mediaType?.startsWith("video/")) {
+      parts.push("A video file is attached. Describe what you can determine about it.")
+    } else {
+      parts.push("Please read this file and respond based on its content.")
+    }
+  }
+
+  // Inject conversation history for session continuity
+  if (historyContext) {
+    parts.push("")
+    parts.push(historyContext)
+  }
+
+  parts.push("")
+  parts.push(task.message)
+
+  return parts.join("\n")
+}
+
+/**
+ * Build CLI args for claude command.
+ */
+function buildClaudeArgs(
+  agent: AgentDef,
+  prompt: string,
+  streaming: boolean,
+  resumeSessionId?: string,
+  modelOverride?: string,
+  /** Static per-agent preamble delivered via --append-system-prompt. Content
+   *  here is Claude-cached across turns as part of the system prompt, so
+   *  moving stable content (agent.systemPrompt + SOUL/IDENTITY/AGENTS.md) out
+   *  of the user-message body and into this arg avoids paying cache-create
+   *  for it on every new session. */
+  systemPromptAppend?: string,
+  /** Per-task flags (autonomy enforcement). Appended last. */
+  extraArgs: string[] = [],
+): string[] {
+  const args: string[] = [
+    "-p", prompt,
+    "--output-format", streaming ? "stream-json" : "json",
+  ]
+
+  // stream-json requires --verbose in recent Claude Code versions
+  if (streaming) {
+    args.push("--verbose")
+  }
+
+  // Resume existing Claude session for conversation continuity
+  if (resumeSessionId) {
+    args.push("--resume", resumeSessionId)
+  }
+
+  const model = modelOverride || agent.model
+  if (model) {
+    args.push("--model", model)
+  }
+
+  if (agent.permissionMode === "bypassPermissions") {
+    args.push("--dangerously-skip-permissions")
+  }
+
+  if (systemPromptAppend && systemPromptAppend.trim().length > 0) {
+    args.push("--append-system-prompt", systemPromptAppend)
+  }
+
+  args.push(...extraArgs)
+  return args
+}
+
+function buildCodexPrompt(prompt: string, systemPromptAppend?: string): string {
+  if (!systemPromptAppend || systemPromptAppend.trim().length === 0) return prompt
+  return `[System]\n${systemPromptAppend.trim()}\n\n[User]\n${prompt}`
+}
+
+function buildOpenCodeArgs(
+  agent: AgentDef,
+  prompt: string,
+  modelOverride?: string,
+  systemPromptAppend?: string,
+  resumeSessionId?: string,
+): string[] {
+  const args = ["run", "--format", "json", "--thinking"]
+  const model = modelOverride || agent.model
+  if (model) args.push("--model", model)
+  if (resumeSessionId) args.push("--session", resumeSessionId)
+  if (agent.permissionMode === "bypassPermissions") args.push("--auto")
+  args.push(buildCodexPrompt(prompt, systemPromptAppend))
+  return args
+}
+
+function extractOpenCodeError(event: any): string | undefined {
+  if (!event || typeof event !== "object" || event.type !== "error") return undefined
+  const value = event.error?.message ?? event.error ?? event.message ?? event.part?.error?.message
+  return typeof value === "string" && value.trim() ? value.trim() : undefined
+}
+
+function tomlString(value: string): string {
+  return JSON.stringify(value)
+}
+
+function buildCodexAgentxMcpArgs(): string[] {
+  const cli = process.argv[1] || "dist/cli.js"
+  return [
+    "-c", `mcp_servers.agentx.command=${tomlString(process.execPath)}`,
+    "-c", `mcp_servers.agentx.args=[${[cli, "serve", "--stdio", "--cwd", process.cwd()].map(tomlString).join(",")}]`,
+  ]
+}
+
+function buildCodexArgs(
+  agent: AgentDef,
+  prompt: string,
+  streaming: boolean,
+  modelOverride?: string,
+  systemPromptAppend?: string,
+  outputFile?: string,
+  resumeSessionId?: string,
+): string[] {
+  const args: string[] = resumeSessionId
+    ? ["exec", "resume"]
+    : ["exec"]
+
+  args.push(
+    "--ignore-user-config",
+    "--skip-git-repo-check",
+    ...buildCodexAgentxMcpArgs(),
+  )
+
+  if (!resumeSessionId) args.push("--color", "never")
+
+  const model = modelOverride || agent.model
+  if (model) args.push("--model", model)
+
+  if (agent.permissionMode === "bypassPermissions") {
+    args.push("--dangerously-bypass-approvals-and-sandbox")
+  } else if (!resumeSessionId) {
+    args.push("--sandbox", "workspace-write")
+  }
+
+  if (streaming || resumeSessionId || outputFile) args.push("--json")
+  if (outputFile) args.push("--output-last-message", outputFile)
+
+  if (resumeSessionId) args.push(resumeSessionId)
+  args.push(buildCodexPrompt(prompt, systemPromptAppend))
+  return args
+}
+
+function buildRuntimeEnv(agent: AgentDef, task: AgentTask): NodeJS.ProcessEnv {
+  const env = buildAgentEnv(agent.workspace)
+  const home = env.HOME || process.env.HOME
+  const pathParts = [
+    env.PATH || "",
+    home ? `${home}/.bun/bin` : "",
+    home ? `${home}/.local/bin` : "",
+    home ? `${home}/.opencode/bin` : "",
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+  ].filter(Boolean)
+  env.PATH = Array.from(new Set(pathParts.flatMap((p) => p.split(":")).filter(Boolean))).join(":")
+  return withCallerEnv(env, task)
+}
+
+/** Export who is running and for which chat, so tools the agent launches
+ *  (the agentx MCP server in particular) can identify the caller without
+ *  trusting model-supplied arguments. This is the per-spawn version, with
+ *  the running task id. A warm persistent process is keyed by (agent,
+ *  channel, chatId) and gets the same agent and chat through
+ *  persistentCallerEnv (claude-process-factory.ts), but no task id, which
+ *  changes every turn. */
+export function withCallerEnv(env: NodeJS.ProcessEnv, task: AgentTask): NodeJS.ProcessEnv {
+  env.AGENTX_AGENT_ID = task.agentId
+  // The running task, so a daemon endpoint the agent calls (agent memory)
+  // can check the caller really is this agent, mid-run.
+  if (task.runningTaskId) env.AGENTX_TASK_ID = task.runningTaskId
+  if (task.context?.channel) env.AGENTX_CHANNEL = task.context.channel
+  if (task.context?.chatId) env.AGENTX_CHAT_ID = task.context.chatId
+  return env
+}
+
+function buildOpenCodeEnv(agent: AgentDef, task: AgentTask): NodeJS.ProcessEnv {
+  const env = buildRuntimeEnv(agent, task)
+  let config: Record<string, any> = {}
+  if (env.OPENCODE_CONFIG_CONTENT) {
+    try { config = JSON.parse(env.OPENCODE_CONFIG_CONTENT) } catch { /* replace invalid inherited content */ }
+  }
+
+  const mcp: Record<string, any> = { ...(config.mcp || {}) }
+  for (const [name, server] of Object.entries(agent.mcp || {}) as Array<[string, any]>) {
+    mcp[name] = server.type === "http"
+      ? { type: "remote", url: server.url, headers: server.headers }
+      : { type: "local", command: [server.command, ...(server.args || [])], environment: server.env }
+  }
+
+  const cli = process.argv[1] || "dist/cli.js"
+  mcp.agentx = {
+    type: "local",
+    command: [process.execPath, cli, "serve", "--stdio", "--cwd", process.cwd()],
+  }
+  env.OPENCODE_CONFIG_CONTENT = JSON.stringify({ ...config, mcp })
+  return env
+}
+
+function extractCodexTextFromEvent(event: any): string | undefined {
+  if (!event || typeof event !== "object") return undefined
+  if (typeof event.delta === "string") return event.delta
+  if (typeof event.text_delta === "string") return event.text_delta
+  if (typeof event.message === "string" && /message|delta/i.test(String(event.type || ""))) return event.message
+  if (typeof event.text === "string" && /message|delta|response/i.test(String(event.type || ""))) return event.text
+
+  const item = event.item || event.msg || event.message
+  if (item?.type === "agent_message" && typeof item.text === "string") return item.text
+  if (typeof item?.text === "string" && /message|delta|response|item/i.test(String(event.type || ""))) return item.text
+  const content = item?.content
+  if (Array.isArray(content)) {
+    const text = content
+      .map((block: any) => typeof block?.text === "string" ? block.text : "")
+      .join("")
+    if (text) return text
+  }
+  return undefined
+}
+
+function firstNumber(...values: unknown[]): number {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return value
+  }
+  return 0
+}
+
+function extractCodexUsage(value: any, depth = 0): TokenUsage | undefined {
+  if (!value || typeof value !== "object" || depth > 4) return undefined
+  const candidate = value.usage || value.token_usage || value.tokenUsage || value.metrics?.usage
+  if (candidate && typeof candidate === "object") {
+    return {
+      inputTokens: firstNumber(candidate.input_tokens, candidate.inputTokens, candidate.prompt_tokens, candidate.promptTokens),
+      outputTokens: firstNumber(candidate.output_tokens, candidate.outputTokens, candidate.completion_tokens, candidate.completionTokens),
+      cacheReadTokens: firstNumber(candidate.cache_read_input_tokens, candidate.cached_input_tokens, candidate.cacheReadTokens, candidate.cachedInputTokens),
+      cacheCreateTokens: firstNumber(candidate.cache_creation_input_tokens, candidate.cacheCreateTokens),
+    }
+  }
+  for (const nested of [value.msg, value.message, value.response, value.result, value.item]) {
+    const usage = extractCodexUsage(nested, depth + 1)
+    if (usage) return usage
+  }
+  return undefined
+}
+
+function extractCodexBilledModel(event: any): string | undefined {
+  if (!event || typeof event !== "object") return undefined
+  return (
+    (typeof event.model === "string" && event.model) ||
+    (typeof event.msg?.model === "string" && event.msg.model) ||
+    (typeof event.message?.model === "string" && event.message.model) ||
+    (typeof event.response?.model === "string" && event.response.model) ||
+    undefined
+  )
+}
+
+function extractCodexSessionId(value: any, depth = 0): string | undefined {
+  if (!value || typeof value !== "object" || depth > 4) return undefined
+  for (const key of ["thread_id", "threadId", "session_id", "sessionId", "conversation_id", "conversationId"]) {
+    const candidate = value[key]
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim()
+  }
+  for (const nested of [value.msg, value.message, value.response, value.result, value.item]) {
+    const sessionId = extractCodexSessionId(nested, depth + 1)
+    if (sessionId) return sessionId
+  }
+  return undefined
+}
+
+function collectCodexRunMetadata(stdout: string | Buffer | undefined): {
+  usage?: TokenUsage
+  billedModel?: string
+  sessionId?: string
+  apiError?: string
+} {
+  const text = typeof stdout === "string" ? stdout : stdout?.toString("utf8") || ""
+  let usage: TokenUsage | undefined
+  let billedModel: string | undefined
+  let sessionId: string | undefined
+  let apiError: string | undefined
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue
+    try {
+      const event = JSON.parse(line)
+      usage = extractCodexUsage(event) || usage
+      billedModel = extractCodexBilledModel(event) || billedModel
+      sessionId = extractCodexSessionId(event) || sessionId
+      apiError = extractCodexErrorMessage(event) || apiError
+    } catch {
+      // Non-JSON output is handled by the caller as content fallback.
+    }
+  }
+  return { usage, billedModel, sessionId, apiError }
+}
+
+/** Extract the human-readable failure message from a codex event.
+ *  Codex emits failures on stdout as JSON, NOT on stderr — so when our
+ *  runtime fell back to stderr.trim() it was returning the benign
+ *  "Reading additional input from stdin..." log line as if it were the
+ *  error. This walks the two known shapes:
+ *    {"type":"error","message":"…"}
+ *    {"type":"turn.failed","error":{"message":"…"}}
+ *  …and unwraps any nested provider JSON inside the message so the
+ *  surfaced text is the actual reason ("model X not supported when
+ *  using Codex with a ChatGPT account") instead of envelope noise. */
+function extractCodexErrorMessage(event: any): string | undefined {
+  if (!event || typeof event !== "object") return undefined
+  if (event.type === "error" && typeof event.message === "string") {
+    return unwrapCodexErrorMessage(event.message)
+  }
+  if (event.type === "turn.failed") {
+    const msg = event.error?.message ?? event.error
+    if (typeof msg === "string") return unwrapCodexErrorMessage(msg)
+  }
+  return undefined
+}
+
+/** Codex sometimes nests a provider JSON envelope inside the message
+ *  string: `{"type":"error","status":400,"error":{"message":"…"}}`.
+ *  Try to peel one layer; fall back to the raw string. */
+function unwrapCodexErrorMessage(raw: string): string {
+  const trimmed = raw.trim()
+  if (trimmed.startsWith("{")) {
+    try {
+      const inner = JSON.parse(trimmed)
+      const nested = inner?.error?.message ?? inner?.message
+      if (typeof nested === "string" && nested.trim()) return nested.trim()
+    } catch { /* leave as-is */ }
+  }
+  return trimmed
+}
+
+/**
+ * Improvement plan #4 — return the resolved permission posture for an
+ * agent, including the actual CLI flag that gets passed (or doesn't).
+ * Lets operators answer "what permissions does my agent actually run
+ * with?" without reading the runtime source. Surfaced on
+ * `GET /agents/:id` and logged at every claude-code spawn so the
+ * operator can grep journalctl.
+ */
+export interface ResolvedPermission {
+  /** Raw value from agentx.json, e.g. "default" / "bypassPermissions" / "plan" / "auto" / etc. */
+  configured: string
+  /** Whether the spawn includes --dangerously-skip-permissions. */
+  skipPermissions: boolean
+  /** Best-effort one-line summary suitable for journalctl. */
+  summary: string
+}
+
+export function resolvePermission(agent: AgentDef): ResolvedPermission {
+  const configured = agent.permissionMode || "default"
+  const skipPermissions = configured === "bypassPermissions"
+  const summary = skipPermissions
+    ? `bypassPermissions (--dangerously-skip-permissions)`
+    : `${configured} (no skip-permissions flag)`
+  return { configured, skipPermissions, summary }
+}
+
+/**
+ * Single-line spawn audit that lands in stderr per dispatch. Lets
+ * operators verify what every claude subprocess was actually invoked
+ * with — specifically the permission flag, which is the load-bearing
+ * security knob. Quiet on info paths (no flooding journalctl) — just
+ * one line per spawn, with the agentId so `journalctl | grep <id>` is
+ * useful.
+ */
+export function logClaudeSpawn(
+  agentId: string,
+  agent: AgentDef,
+  modelOverride: string | undefined,
+  resumeSessionId: string | undefined,
+  via: "spawn" | "stream" | "persistent",
+): void {
+  const perm = resolvePermission(agent)
+  const model = modelOverride || agent.model || "<default>"
+  const resume = resumeSessionId ? ` resume=${resumeSessionId.slice(0, 8)}…` : ""
+  // Use process.stderr directly so this surfaces under journalctl even
+  // when an agent's logger is detached. Single line, prefixed for grep.
+  process.stderr.write(`[claude-spawn] agent=${agentId} via=${via} model=${model} perm=${perm.summary}${resume}\n`)
+}
+
+/**
+ * Parse JSON output from `claude -p --output-format json`.
+ * Returns the text result and session_id.
+ */
+export interface TokenUsage {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreateTokens: number
+}
+
+/**
+ * When the Claude Code CLI returns exit=0 but the run itself errored (e.g.
+ * out-of-credits mid-session), it emits a top-level JSON object with
+ * `is_error: true` and the raw API error in `result`. Detect + extract so we
+ * can run the same friendly-error translator we use for stderr.
+ * Returns null when the output is a normal success.
+ */
+function extractClaudeIsError(stdout: string): string | null {
+  try {
+    const data = JSON.parse(stdout)
+    if (data && data.is_error && typeof data.result === "string") return data.result
+    if (data && data.error && typeof data.error === "string") return data.error
+  } catch { /* not JSON — fall through */ }
+  return null
+}
+
+function parseClaudeJsonOutput(stdout: string): { text: string; sessionId?: string; usage?: TokenUsage; billedModel?: string; numTurns?: number } {
+  try {
+    const data = JSON.parse(stdout)
+    const usage = data.usage ? {
+      inputTokens: data.usage.input_tokens || 0,
+      outputTokens: data.usage.output_tokens || 0,
+      cacheReadTokens: data.usage.cache_read_input_tokens || 0,
+      cacheCreateTokens: data.usage.cache_creation_input_tokens || 0,
+    } : undefined
+
+    // Claude Code's --output-format json response carries the actual billed
+    // model at `model` (or nested under `message.model` depending on CLI ver).
+    const billedModel: string | undefined =
+      (typeof data.model === "string" && data.model) ||
+      (typeof data.message?.model === "string" && data.message.model) ||
+      undefined
+
+    return {
+      text: data.result || data.content || "",
+      sessionId: data.session_id,
+      usage,
+      billedModel,
+      numTurns: typeof data.num_turns === "number" ? data.num_turns : undefined,
+    }
+  } catch {
+    return { text: stdout }
+  }
+}
+
+/**
+ * Execute a task using the Claude Code CLI (tier: "claude-code").
+ * Non-streaming — waits for full response.
+ */
+export async function executeClaudeCode(
+  agent: AgentDef,
+  task: AgentTask,
+  historyContext?: string,
+  resumeSessionId?: string,
+  abortSignal?: AbortSignal,
+): Promise<AgentResponse> {
+  const start = Date.now()
+  // Always inject context (landscape, rules, channel info) even on resume.
+  // Claude CLI --resume carries its own conversation history, but the
+  // landscape + rules must be fresh so the agent sees capability updates.
+  const prompt = buildPrompt(agent, task, historyContext)
+  const restricted = restrictedClaudeArgs(task)
+  if ("error" in restricted) return { content: "", error: restricted.error, duration: Date.now() - start }
+  const args = buildClaudeArgs(agent, prompt, false, resumeSessionId, task.model, task.systemPromptAppend, restricted.args)
+  logClaudeSpawn(task.agentId, agent, task.model, resumeSessionId, "spawn")
+
+  // If the caller already aborted before we spawned, short-circuit so we
+  // don't spend tokens on a doomed run.
+  if (abortSignal?.aborted) {
+    return { content: "", error: "task cancelled by operator", duration: Date.now() - start }
+  }
+
+  let abortReason: string | undefined
+  try {
+    const timeoutMs = Math.max(60_000, (agent.maxExecutionMinutes ?? 20) * 60_000)
+    const { stdout, stderr, exitCode, killed } = await new Promise<{ stdout: string; stderr: string; exitCode: number | string; killed: boolean }>((resolve) => {
+      const childEnv = claudeBillingEnv(withCallerEnv(buildAgentEnv(agent.workspace), task), agent.billing)
+      let killed = false
+      const proc = execFile("claude", args, {
+        cwd: agent.workspace,
+        timeout: timeoutMs,
+        maxBuffer: 10 * 1024 * 1024,
+        env: { ...childEnv, HOME: childEnv.HOME || "/home/" + (childEnv.USER || "user") },
+      }, (error, stdout, stderr) => {
+        // Always resolve — we handle errors ourselves based on stdout/stderr
+        resolve({
+          stdout: stdout || "",
+          stderr: stderr || "",
+          exitCode: error ? (error as any).code ?? 1 : 0,
+          killed,
+        })
+      })
+      // Close stdin immediately. Claude CLI otherwise waits 3s for input then
+      // proceeds with a warning; in cron retries that cascade invalidates the
+      // prompt cache between attempts (5× input cost on cache-create).
+      proc.stdin?.end()
+      // Operator-initiated cancellation. SIGTERM first; if the child is still
+      // alive after 3s, escalate to SIGKILL. The execFile callback fires when
+      // the child exits, which resolves the outer promise.
+      if (abortSignal) {
+        const onAbort = () => {
+          killed = true
+          abortReason = (abortSignal.reason as any)?.message || (typeof abortSignal.reason === "string" ? abortSignal.reason : "task cancelled by operator")
+          try { proc.kill("SIGTERM") } catch { /* */ }
+          setTimeout(() => { try { if (!proc.killed) proc.kill("SIGKILL") } catch { /* */ } }, 3000).unref?.()
+        }
+        if (abortSignal.aborted) onAbort()
+        else abortSignal.addEventListener("abort", onAbort, { once: true })
+      }
+    })
+
+    if (killed) {
+      return {
+        content: "",
+        error: abortReason || "task cancelled by operator",
+        errorKind: "cancelled",
+        duration: Date.now() - start,
+      }
+    }
+
+    if (!stdout && exitCode !== 0) {
+      // exit 143 = 128+SIGTERM. It is our own `timeout` only when the run
+      // actually reached it; earlier, something else stopped the process
+      // (a daemon shutdown), and raising maxExecutionMinutes would not help.
+      let errMsg: string
+      const ranMs = Date.now() - start
+      if (exitCode === 143 && ranMs < timeoutMs - SIGTERM_TIMEOUT_SLACK_MS) {
+        return {
+          content: "",
+          error: `Claude Code was stopped (SIGTERM) after ${Math.round(ranMs / 1000)}s, before its ${Math.round(timeoutMs / 60_000)}m time limit`,
+          errorKind: "interrupted",
+          duration: ranMs,
+        }
+      }
+      if (exitCode === 143) {
+        errMsg = `Claude Code timed out after ${Math.round(timeoutMs / 60_000)}m (SIGTERM). Bump agent.maxExecutionMinutes for "${agent.name || "this agent"}" if tasks need longer.`
+      } else if (exitCode === "ENOENT" || /ENOENT|spawn claude/i.test(stderr || "")) {
+        errMsg = claudeMissingMessage()
+      } else {
+        errMsg = stderr?.trim() || `Claude Code exited with code ${exitCode}`
+      }
+      return {
+        content: "",
+        ...buildErrorEnvelope(errMsg),
+        duration: Date.now() - start,
+      }
+    }
+
+    // Claude Code sometimes exits 0 but embeds the API error in stdout's
+    // "result" field when `is_error` is set. Translate that too.
+    const apiErrorInStdout = extractClaudeIsError(stdout)
+    if (apiErrorInStdout) {
+      return {
+        content: "",
+        ...buildErrorEnvelope(apiErrorInStdout),
+        duration: Date.now() - start,
+      }
+    }
+
+    const parsed = parseClaudeJsonOutput(stdout)
+
+    return {
+      content: parsed.text,
+      duration: Date.now() - start,
+      claudeSessionId: parsed.sessionId,
+      usage: parsed.usage,
+      numTurns: parsed.numTurns,
+      billedModel: parsed.billedModel,
+    }
+  } catch (error: any) {
+    console.error(`[runtime] execFile threw: ${error.message}`)
+    return {
+      content: "",
+      error: error.message || "Claude Code failed",
+      duration: Date.now() - start,
+    }
+  }
+}
+
+/**
+ * Execute with streaming — calls onDelta with text chunks as they arrive.
+ * Uses claude --output-format stream-json to get real-time output.
+ */
+export async function executeClaudeCodeStreaming(
+  agent: AgentDef,
+  task: AgentTask,
+  onDelta: StreamCallback,
+  historyContext?: string,
+  resumeSessionId?: string,
+  onEvent?: (event: any) => void,
+  abortSignal?: AbortSignal,
+): Promise<AgentResponse> {
+  const start = Date.now()
+  if (abortSignal?.aborted) {
+    return { content: "", error: "task cancelled by operator", duration: Date.now() - start }
+  }
+  // Always inject context (landscape, rules, channel info) even on resume.
+  // Claude CLI --resume carries its own conversation history, but the
+  // landscape + rules must be fresh so the agent sees capability updates.
+  const prompt = buildPrompt(agent, task, historyContext)
+  const restricted = restrictedClaudeArgs(task)
+  if ("error" in restricted) return { content: "", error: restricted.error, duration: Date.now() - start }
+  const args = buildClaudeArgs(agent, prompt, true, resumeSessionId, task.model, task.systemPromptAppend, restricted.args)
+  logClaudeSpawn(task.agentId, agent, task.model, resumeSessionId, "stream")
+
+  let fullText = ""
+  // Capture model + usage + session id from the stream events — Claude Code
+  // emits a system-init event up front (with the billed model) and a terminal
+  // result event with the full usage accounting. Without these we can't
+  // attribute cost correctly for streamed tasks.
+  let streamBilledModel: string | undefined
+  let streamUsage: TokenUsage | undefined
+  let streamSessionId: string | undefined
+  /** Last assistant event's per-call context size — see AgentResponse.contextTokens. */
+  let streamContextTokens: number | undefined
+  let streamNumTurns: number | undefined
+  /** If the terminal `result` event carries is_error, we stash it here and
+   *  surface the translated message instead of treating `result` as agent text. */
+  let streamApiError: string | undefined
+
+  try {
+    const streamTimeoutMs = Math.max(60_000, (agent.maxExecutionMinutes ?? 20) * 60_000)
+    const spawnEnv = claudeBillingEnv(withCallerEnv(buildAgentEnv(agent.workspace), task), agent.billing)
+    const proc = execa("claude", args, {
+      cwd: agent.workspace,
+      timeout: streamTimeoutMs,
+      reject: false,
+      env: spawnEnv,
+      extendEnv: false,
+      // Don't buffer — we'll read stdout line by line
+      buffer: false,
+      // Close stdin so Claude CLI doesn't wait 3s for input (see executeClaudeCode).
+      stdin: "ignore",
+    })
+    // Settled by the terminal `result` event. The answer is complete at
+    // that point; what follows is the CLI's own teardown (SessionEnd hook,
+    // MCP servers), which the persistent path never waited for either.
+    let markResultSeen: () => void = () => {}
+    const resultSeen = new Promise<void>((r) => { markResultSeen = r })
+
+    // Operator cancellation. SIGTERM → SIGKILL escalation after 3s; we mark
+    // the run as cancelled so the post-await result-mapping below surfaces a
+    // clean "task cancelled" error instead of a garbled "killed by signal".
+    let cancelled = false
+    let cancelReason: string | undefined
+    if (abortSignal) {
+      const onAbort = () => {
+        cancelled = true
+        cancelReason = (abortSignal.reason as any)?.message || (typeof abortSignal.reason === "string" ? abortSignal.reason : "task cancelled by operator")
+        try { proc.kill("SIGTERM") } catch { /* */ }
+        setTimeout(() => { try { proc.kill("SIGKILL") } catch { /* */ } }, 3000).unref?.()
+      }
+      if (abortSignal.aborted) onAbort()
+      else abortSignal.addEventListener("abort", onAbort, { once: true })
+    }
+
+    // Parse stream-json output line by line.
+    // StringDecoder buffers partial UTF-8 sequences across chunk
+    // boundaries; plain Buffer.toString() does not, so a chunk that
+    // ends mid-character (Arabic = 2 bytes, common emoji = 4 bytes)
+    // produced replacement chars or dropped letters in the agent's
+    // outbound text. The user reported "letters missing from words"
+    // on WhatsApp specifically — Arabic + emoji-heavy traffic is
+    // exactly the workload that exposes this. Hoisted out of the if
+    // block so the post-`await proc` flush can call decoder.end().
+    let lineBuffer = ""
+    const decoder = new StringDecoder("utf8")
+    if (proc.stdout) {
+      proc.stdout.on("data", (chunk: Buffer) => {
+        lineBuffer += decoder.write(chunk as Buffer)
+        const lines = lineBuffer.split("\n")
+        lineBuffer = lines.pop() || ""
+
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try {
+            const event = JSON.parse(line)
+
+            // Surface every parsed event for observability (dashboard streaming).
+            // Best-effort — never let a subscriber crash the runtime.
+            if (onEvent) {
+              try { onEvent(event) } catch { /* */ }
+            }
+
+            // Every "assistant" event is a full API message envelope whose
+            // usage covers THAT call only — input + cache tokens ≈ the
+            // context size of the request that produced it. The last one
+            // seen is the end-of-turn context size (rotation metric).
+            if (event.type === "assistant" && event.message?.usage) {
+              const u = event.message.usage
+              const callContext =
+                (u.input_tokens || 0) +
+                (u.cache_read_input_tokens || 0) +
+                (u.cache_creation_input_tokens || 0)
+              if (callContext > 0) streamContextTokens = callContext
+            }
+
+            // Claude stream-json emits different event types
+            // "assistant" messages with content contain the text
+            if (event.type === "assistant" && event.message?.content) {
+              for (const block of event.message.content) {
+                if (block.type === "text" && block.text) {
+                  const delta = block.text.slice(fullText.length)
+                  if (delta) {
+                    fullText = block.text
+                    onDelta(delta, fullText)
+                  }
+                }
+              }
+            }
+
+            // "content_block_delta" for streaming text
+            if (event.type === "content_block_delta" && event.delta?.text) {
+              fullText += event.delta.text
+              onDelta(event.delta.text, fullText)
+            }
+
+            // "result" event contains final text (or an API error, when is_error).
+            if (event.type === "result") markResultSeen()
+            if (event.type === "result" && event.result) {
+              if (event.is_error && typeof event.result === "string") {
+                streamApiError = event.result
+              } else {
+                const resultText = typeof event.result === "string"
+                  ? event.result
+                  : event.result
+                if (typeof resultText === "string" && resultText.length > fullText.length) {
+                  const delta = resultText.slice(fullText.length)
+                  fullText = resultText
+                  if (delta) onDelta(delta, fullText)
+                }
+              }
+              // Final event also carries the authoritative usage + model + session.
+              if (event.usage) {
+                streamUsage = {
+                  inputTokens: event.usage.input_tokens || 0,
+                  outputTokens: event.usage.output_tokens || 0,
+                  cacheReadTokens: event.usage.cache_read_input_tokens || 0,
+                  cacheCreateTokens: event.usage.cache_creation_input_tokens || 0,
+                }
+              }
+              if (typeof event.model === "string") streamBilledModel = event.model
+              if (typeof event.session_id === "string") streamSessionId = event.session_id
+              if (typeof event.num_turns === "number") streamNumTurns = event.num_turns
+            }
+
+            // System-init event (first thing the CLI emits) carries the model
+            // it's about to invoke — capture early so we have it even if the
+            // run errors before the terminal result.
+            //
+            // Do NOT capture session_id from init: when --resume <X> is
+            // passed, init's session_id echoes X back (the resumed-from ID),
+            // not the new ID Claude rolls into for THIS turn. Persisting X
+            // means the next turn re-resumes from before this turn's progress
+            // — exactly the "wrong-message resume" symptom. Only `result`
+            // carries the authoritative new session_id (line above).
+            if (event.type === "system" && event.subtype === "init") {
+              if (typeof event.model === "string") streamBilledModel = event.model
+              if (process.env.AGENTX_DEBUG_CLAUDE_ENV === "1") {
+                process.stderr.write(`[claude-init] agent=${task.agentId} apiKeySource=${event.apiKeySource} version=${event.claude_code_version} model=${event.model} permMode=${event.permissionMode}\n`)
+              }
+            }
+          } catch {
+            // Not JSON — could be raw text output, append it
+            if (line.trim() && !line.startsWith("{")) {
+              fullText += line + "\n"
+              onDelta(line + "\n", fullText)
+            }
+          }
+        }
+      })
+    }
+
+    const result = await settleAfterResult(proc, resultSeen)
+
+    // Flush any partial UTF-8 sequence still buffered in the decoder.
+    // The stream-json output normally ends with a newline so this is a
+    // no-op, but it keeps the channel honest if the producer ever
+    // exits mid-character.
+    const tail = decoder.end()
+    if (tail) lineBuffer += tail
+
+    // Operator cancellation wins over any partial stream — surface the
+    // friendly error so callers (KPI, dashboard, channel ack) record it
+    // distinctly from a timeout or model failure.
+    if (cancelled) {
+      return {
+        content: "",
+        error: cancelReason || "task cancelled by operator",
+        errorKind: "cancelled",
+        duration: Date.now() - start,
+      }
+    }
+
+    // If we got no streaming content, fall back to stdout
+    if (!fullText && result.stdout) {
+      fullText = typeof result.stdout === "string" ? result.stdout : ""
+    }
+
+    if (result.exitCode !== 0 && !fullText) {
+      const stderr = typeof result.stderr === "string" ? result.stderr : ""
+      // execa sets exitCode=undefined when the child is killed by signal —
+      // surface that as a recognizable timeout message instead of leaking
+      // "exited with code undefined" into the user's chat. Mirrors the
+      // non-streaming path's exit-143 handling.
+      const r = result as { exitCode?: number; signal?: string; timedOut?: boolean; failed?: boolean; code?: string; shortMessage?: string }
+      let errMsg: string
+      if (r.timedOut) {
+        errMsg = `Claude Code timed out after ${Math.round(streamTimeoutMs / 60_000)}m. Bump agent.maxExecutionMinutes for "${agent.name || "this agent"}" if tasks need longer.`
+      } else if (r.signal) {
+        errMsg = stderr.trim() || `Claude Code killed by signal ${r.signal}`
+      } else if (r.code === "ENOENT" || /ENOENT|spawn claude/i.test((r.shortMessage || "") + " " + stderr)) {
+        // execa surfaces "binary not on PATH" as { failed: true, code: 'ENOENT',
+        // exitCode: undefined } — without an explicit branch this used to leak
+        // through as "Claude Code exited with code unknown", leaving operators
+        // with no clue that the issue is a missing CLI.
+        errMsg = claudeMissingMessage()
+      } else {
+        errMsg = stderr.trim() || `Claude Code exited with code ${r.exitCode ?? "unknown"}`
+      }
+      return {
+        content: "",
+        ...buildErrorEnvelope(errMsg),
+        duration: Date.now() - start,
+      }
+    }
+
+    if (streamApiError) {
+      return {
+        content: "",
+        ...buildErrorEnvelope(streamApiError),
+        duration: Date.now() - start,
+        usage: streamUsage,
+        contextTokens: streamContextTokens,
+        numTurns: streamNumTurns,
+        billedModel: streamBilledModel,
+        claudeSessionId: streamSessionId,
+      }
+    }
+
+    return {
+      content: fullText,
+      duration: Date.now() - start,
+      usage: streamUsage,
+      contextTokens: streamContextTokens,
+      numTurns: streamNumTurns,
+      billedModel: streamBilledModel,
+      claudeSessionId: streamSessionId,
+    }
+  } catch (error: any) {
+    return {
+      content: fullText || "",
+      ...buildErrorEnvelope(error.message),
+      duration: Date.now() - start,
+      usage: streamUsage,
+      contextTokens: streamContextTokens,
+      numTurns: streamNumTurns,
+      billedModel: streamBilledModel,
+      claudeSessionId: streamSessionId,
+    }
+  }
+}
+
+export async function executeCodexCli(
+  agent: AgentDef,
+  task: AgentTask,
+  historyContext?: string,
+  resumeSessionId?: string,
+): Promise<AgentResponse> {
+  const start = Date.now()
+  const prompt = buildPrompt(agent, task, historyContext)
+  const tmp = mkdtempSync(join(tmpdir(), "agentx-codex-"))
+  const outputFile = join(tmp, "last-message.txt")
+  const args = buildCodexArgs(agent, prompt, false, task.model, task.systemPromptAppend, outputFile, resumeSessionId)
+
+  try {
+    const timeoutMs = Math.max(60_000, (agent.maxExecutionMinutes ?? 20) * 60_000)
+    const result = await execa("codex", args, {
+      cwd: agent.workspace,
+      timeout: timeoutMs,
+      reject: false,
+      env: buildRuntimeEnv(agent, task),
+      extendEnv: false,
+      stdin: "ignore",
+    })
+
+    // Parse the JSON event stream first so we can prefer the real API
+    // error (carried on stdout) over codex's benign stderr log lines.
+    const metadata = collectCodexRunMetadata(result.stdout)
+
+    // Treat a recorded API error as a failure even when codex itself
+    // exits 0 — auth/model/quota errors come back as "turn.failed"
+    // events but don't always set a non-zero exit.
+    if (result.exitCode !== 0 || metadata.apiError) {
+      const r = result as { exitCode?: number; signal?: string; timedOut?: boolean; code?: string; shortMessage?: string }
+      let errMsg: string
+      if (r.timedOut) {
+        errMsg = `Codex CLI timed out after ${Math.round(timeoutMs / 60_000)}m. Bump agent.maxExecutionMinutes for "${agent.name || "this agent"}" if tasks need longer.`
+      } else if (metadata.apiError) {
+        // Real API failure surfaced from the JSON event stream — beats
+        // stderr noise like "Reading additional input from stdin...".
+        errMsg = metadata.apiError
+      } else if (r.signal) {
+        errMsg = result.stderr.trim() || `Codex CLI killed by signal ${r.signal}`
+      } else if (r.code === "ENOENT" || /ENOENT|spawn codex/i.test((r.shortMessage || "") + " " + result.stderr)) {
+        errMsg = codexMissingMessage()
+      } else {
+        errMsg = result.stderr.trim() || result.stdout.trim() || `Codex CLI exited with code ${r.exitCode ?? "unknown"}`
+      }
+      return {
+        content: "",
+        ...buildErrorEnvelope(errMsg),
+        duration: Date.now() - start,
+        usage: metadata.usage,
+        billedModel: metadata.billedModel,
+        codexSessionId: metadata.sessionId || resumeSessionId,
+      }
+    }
+
+    let content = ""
+    try { content = readFileSync(outputFile, "utf8").trim() } catch { /* fall back below */ }
+    if (!content) content = result.stdout.trim()
+    return {
+      content,
+      duration: Date.now() - start,
+      usage: metadata.usage,
+      billedModel: metadata.billedModel,
+      codexSessionId: metadata.sessionId || resumeSessionId,
+    }
+  } catch (error: any) {
+    const raw = /ENOENT|spawn codex/i.test(error?.message || "") ? codexMissingMessage() : error?.message
+    return { content: "", ...buildErrorEnvelope(raw || "Codex CLI failed"), duration: Date.now() - start }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+export async function executeCodexCliStreaming(
+  agent: AgentDef,
+  task: AgentTask,
+  onDelta: StreamCallback,
+  historyContext?: string,
+  resumeSessionId?: string,
+  onEvent?: (event: any) => void,
+): Promise<AgentResponse> {
+  const start = Date.now()
+  const prompt = buildPrompt(agent, task, historyContext)
+  const tmp = mkdtempSync(join(tmpdir(), "agentx-codex-"))
+  const outputFile = join(tmp, "last-message.txt")
+  const args = buildCodexArgs(agent, prompt, true, task.model, task.systemPromptAppend, outputFile, resumeSessionId)
+  let fullText = ""
+  let streamUsage: TokenUsage | undefined
+  let streamBilledModel: string | undefined
+  let streamSessionId: string | undefined
+  let streamApiError: string | undefined
+
+  try {
+    const timeoutMs = Math.max(60_000, (agent.maxExecutionMinutes ?? 20) * 60_000)
+    const proc = execa("codex", args, {
+      cwd: agent.workspace,
+      timeout: timeoutMs,
+      reject: false,
+      env: buildRuntimeEnv(agent, task),
+      extendEnv: false,
+      buffer: false,
+      stdin: "ignore",
+    })
+    if (onEvent) {
+      try {
+        onEvent({
+          type: "codex.spawned",
+          model: task.model || agent.model,
+          resumeSessionId,
+        })
+      } catch { /* */ }
+    }
+
+    let lineBuffer = ""
+    let stderrText = ""
+    let idleTimedOut = false
+    const decoder = new StringDecoder("utf8")
+    const stderrDecoder = new StringDecoder("utf8")
+    const idleTimeoutMs = Math.min(
+      timeoutMs,
+      Math.max(30_000, Number(process.env.AGENTX_CODEX_IDLE_TIMEOUT_MS || 180_000)),
+    )
+    let idleTimer: ReturnType<typeof setTimeout> | undefined
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        idleTimedOut = true
+        ;(proc as any).kill("SIGTERM", { forceKillAfterTimeout: 5_000 })
+      }, idleTimeoutMs)
+    }
+    resetIdleTimer()
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      resetIdleTimer()
+      stderrText += stderrDecoder.write(chunk)
+      if (stderrText.length > 16_000) stderrText = stderrText.slice(-16_000)
+    })
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      resetIdleTimer()
+      lineBuffer += decoder.write(chunk)
+      const lines = lineBuffer.split("\n")
+      lineBuffer = lines.pop() || ""
+      for (const line of lines) {
+        if (!line.trim()) continue
+        try {
+          const event = JSON.parse(line)
+          if (onEvent) {
+            try { onEvent(event) } catch { /* */ }
+          }
+          streamUsage = extractCodexUsage(event) || streamUsage
+          streamBilledModel = extractCodexBilledModel(event) || streamBilledModel
+          streamSessionId = extractCodexSessionId(event) || streamSessionId
+          streamApiError = extractCodexErrorMessage(event) || streamApiError
+          const text = extractCodexTextFromEvent(event)
+          if (text && text !== fullText) {
+            const delta = text.startsWith(fullText) ? text.slice(fullText.length) : text
+            fullText = text.startsWith(fullText) ? text : fullText + text
+            if (delta) onDelta(delta, fullText)
+          }
+        } catch {
+          fullText += line + "\n"
+          onDelta(line + "\n", fullText)
+        }
+      }
+    })
+
+    const result = await proc
+    if (idleTimer) clearTimeout(idleTimer)
+    const tail = decoder.end()
+    if (tail) lineBuffer += tail
+    const stderrTail = stderrDecoder.end()
+    if (stderrTail) stderrText += stderrTail
+
+    // A recorded API error from the JSON event stream wins even when
+    // the run produced some incidental text or codex exited 0 — the
+    // turn failed and the user wants to know why, not see partial output.
+    if ((result.exitCode !== 0 && !fullText) || streamApiError) {
+      const stderr = stderrText || (typeof result.stderr === "string" ? result.stderr : "")
+      const r = result as { exitCode?: number; signal?: string; timedOut?: boolean; code?: string; shortMessage?: string }
+      let errMsg: string
+      if (idleTimedOut) errMsg = `Codex CLI produced no output for ${Math.round(idleTimeoutMs / 1000)}s and was stopped. AgentX sent a smaller prompt; retry the task or set AGENTX_CODEX_IDLE_TIMEOUT_MS if this turn needs longer.`
+      else if (r.timedOut) errMsg = `Codex CLI timed out after ${Math.round(timeoutMs / 60_000)}m. Bump agent.maxExecutionMinutes for "${agent.name || "this agent"}" if tasks need longer.`
+      else if (streamApiError) errMsg = streamApiError
+      else if (r.signal) errMsg = stderr.trim() || `Codex CLI killed by signal ${r.signal}`
+      else if (r.code === "ENOENT" || /ENOENT|spawn codex/i.test((r.shortMessage || "") + " " + stderr)) errMsg = codexMissingMessage()
+      else errMsg = stderr.trim() || `Codex CLI exited with code ${r.exitCode ?? "unknown"}`
+      return {
+        content: "",
+        ...buildErrorEnvelope(errMsg),
+        duration: Date.now() - start,
+        usage: streamUsage,
+        billedModel: streamBilledModel,
+        codexSessionId: streamSessionId || resumeSessionId,
+      }
+    }
+
+    let finalText = ""
+    try { finalText = readFileSync(outputFile, "utf8").trim() } catch { /* */ }
+    if (finalText && finalText !== fullText) {
+      const delta = finalText.startsWith(fullText) ? finalText.slice(fullText.length) : finalText
+      fullText = finalText
+      if (delta) onDelta(delta, fullText)
+    }
+    return {
+      content: fullText,
+      duration: Date.now() - start,
+      usage: streamUsage,
+      billedModel: streamBilledModel,
+      codexSessionId: streamSessionId || resumeSessionId,
+    }
+  } catch (error: any) {
+    const raw = /ENOENT|spawn codex/i.test(error?.message || "") ? codexMissingMessage() : error?.message
+    return { content: fullText, ...buildErrorEnvelope(raw || "Codex CLI failed"), duration: Date.now() - start, usage: streamUsage, billedModel: streamBilledModel, codexSessionId: streamSessionId || resumeSessionId }
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+export async function executeOpenCodeCli(
+  agent: AgentDef,
+  task: AgentTask,
+  onDelta?: StreamCallback,
+  historyContext?: string,
+  resumeSessionId?: string,
+  onEvent?: (event: any) => void,
+  abortSignal?: AbortSignal,
+  onThinking?: ThinkingCallback,
+): Promise<AgentResponse> {
+  const start = Date.now()
+  if (abortSignal?.aborted) {
+    return { content: "", error: "task cancelled by operator", errorKind: "cancelled", duration: 0 }
+  }
+
+  const prompt = buildPrompt(agent, task, historyContext)
+  const args = buildOpenCodeArgs(agent, prompt, task.model, task.systemPromptAppend, task.freshSession ? undefined : resumeSessionId)
+  let fullText = ""
+  let usage: TokenUsage | undefined
+  let sessionId = task.freshSession ? undefined : resumeSessionId
+  let apiError: string | undefined
+  let server: Awaited<ReturnType<typeof openCodeProcessPool.acquire>> | undefined
+  let failed = true
+  let cleanupAbort: (() => void) | undefined
+
+  try {
+    const timeoutMs = Math.max(60_000, (agent.maxExecutionMinutes ?? 20) * 60_000)
+    let env = buildOpenCodeEnv(agent, task)
+    if (agent.persistentProcess) {
+      try {
+        server = await openCodeProcessPool.acquire({
+          key: JSON.stringify([task.agentId, task.context?.channel, task.context?.chatId]),
+          cwd: agent.workspace, env, model: task.model || agent.model,
+          permission: agent.permissionMode, fresh: task.freshSession, signal: abortSignal,
+        })
+        args.splice(1, 0, "--server", server.url)
+        env = server.env
+        onEvent?.({ type: "opencode.ready", reused: server.reused, startupMs: Date.now() - start })
+      } catch (error) {
+        if (!(error instanceof OpenCodeServerUnavailable)) throw error
+        if (error.standalone) args.splice(1, 0, "--standalone")
+        onEvent?.({ type: "opencode.fallback", reason: error.message })
+      }
+    }
+    if (abortSignal?.aborted) throw new Error("task cancelled by operator")
+    const proc = execa("opencode", args, {
+      cwd: agent.workspace,
+      timeout: timeoutMs,
+      reject: false,
+      env,
+      extendEnv: false,
+      buffer: false,
+      stdin: "ignore",
+    })
+    try { onEvent?.({ type: "opencode.spawned", model: task.model || agent.model, resumeSessionId }) } catch { /* */ }
+
+    let cancelled = false
+    let cancelReason: string | undefined
+    const onAbort = () => {
+      server?.invalidate()
+      cancelled = true
+      cancelReason = (abortSignal?.reason as any)?.message || (typeof abortSignal?.reason === "string" ? abortSignal.reason : "task cancelled by operator")
+      try { proc.kill("SIGTERM", { forceKillAfterTimeout: 3_000 }) } catch { /* */ }
+    }
+    if (abortSignal) abortSignal.addEventListener("abort", onAbort, { once: true })
+    cleanupAbort = () => abortSignal?.removeEventListener("abort", onAbort)
+    if (abortSignal?.aborted) onAbort()
+
+    let lineBuffer = ""
+    let stderrText = ""
+    const decoder = new StringDecoder("utf8")
+    const stderrDecoder = new StringDecoder("utf8")
+    const consumeLine = (line: string) => {
+      if (!line.trim()) return
+      try {
+        const event = JSON.parse(line)
+        try { onEvent?.(event) } catch { /* */ }
+        if (typeof event.sessionID === "string") sessionId = event.sessionID
+        const text = event.type === "text" && typeof event.part?.text === "string" ? event.part.text : undefined
+        if (text) {
+          if (!fullText) onEvent?.({ type: "opencode.first_output", elapsedMs: Date.now() - start, reused: server?.reused ?? false })
+          fullText += text
+          onDelta?.(text, fullText)
+        }
+        const reasoning = event.type === "reasoning" && typeof event.part?.text === "string" ? event.part.text : undefined
+        if (reasoning) onThinking?.(reasoning)
+        const tokens = event.type === "step_finish" ? event.part?.tokens : undefined
+        if (tokens) {
+          usage = {
+            inputTokens: firstNumber(tokens.input),
+            outputTokens: firstNumber(tokens.output),
+            cacheReadTokens: firstNumber(tokens.cache?.read),
+            cacheCreateTokens: firstNumber(tokens.cache?.write),
+          }
+        }
+        apiError = extractOpenCodeError(event) || apiError
+      } catch {
+        fullText += line + "\n"
+        onDelta?.(line + "\n", fullText)
+      }
+    }
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      lineBuffer += decoder.write(chunk)
+      const lines = lineBuffer.split("\n")
+      lineBuffer = lines.pop() || ""
+      for (const line of lines) consumeLine(line)
+    })
+    proc.stderr?.on("data", (chunk: Buffer) => { stderrText += stderrDecoder.write(chunk) })
+
+    const result = await proc
+    if (abortSignal) abortSignal.removeEventListener("abort", onAbort)
+    lineBuffer += decoder.end()
+    if (lineBuffer.trim()) consumeLine(lineBuffer)
+    stderrText += stderrDecoder.end()
+
+    if (cancelled) {
+      return { content: "", error: cancelReason || "task cancelled by operator", errorKind: "cancelled", duration: Date.now() - start, opencodeSessionId: sessionId }
+    }
+    if (result.exitCode !== 0 || apiError) {
+      const r = result as { exitCode?: number; signal?: string; timedOut?: boolean; code?: string; shortMessage?: string }
+      let errMsg: string
+      if (r.timedOut) errMsg = `OpenCode timed out after ${Math.round(timeoutMs / 60_000)}m. Bump agent.maxExecutionMinutes for "${agent.name || "this agent"}" if tasks need longer.`
+      else if (apiError) errMsg = apiError
+      else if (r.code === "ENOENT" || /ENOENT|spawn opencode/i.test((r.shortMessage || "") + " " + stderrText)) errMsg = openCodeMissingMessage()
+      else errMsg = stderrText.trim() || `OpenCode exited with code ${r.exitCode ?? "unknown"}`
+      return { content: "", ...buildErrorEnvelope(errMsg), duration: Date.now() - start, usage, opencodeSessionId: sessionId }
+    }
+    failed = false
+    return { content: fullText.trim(), duration: Date.now() - start, usage, billedModel: task.model || agent.model, opencodeSessionId: sessionId }
+  } catch (error: any) {
+    if (abortSignal?.aborted) return { content: "", error: "task cancelled by operator", errorKind: "cancelled", duration: Date.now() - start }
+    const raw = /ENOENT|spawn opencode/i.test(error?.message || "") ? openCodeMissingMessage() : error?.message
+    return { content: fullText, ...buildErrorEnvelope(raw || "OpenCode failed"), duration: Date.now() - start, usage, opencodeSessionId: sessionId }
+  } finally {
+    cleanupAbort?.()
+    server?.release(failed)
+  }
+}
+/**
+ * Execute a task using the Claude Agent SDK (tier: "sdk").
+ */
+export async function executeSdk(
+  agent: AgentDef,
+  task: AgentTask,
+  apiKey: string,
+  historyContext?: string,
+): Promise<AgentResponse> {
+  const start = Date.now()
+
+  try {
+    // @ts-ignore — SDK may not be installed
+    const sdk = await import("@anthropic-ai/claude-agent-sdk")
+    const { query } = sdk
+
+    // Build prompt with full context (landscape, memory, patterns, etc.)
+    const prompt = buildPrompt(agent, task, historyContext)
+
+    let content = ""
+
+    const q = query({
+      prompt,
+      options: {
+        model: task.model || agent.model,
+        cwd: agent.workspace,
+        permissionMode: "bypassPermissions" as any,
+      },
+    })
+
+    for await (const message of q) {
+      if (message.type === "result" && message.subtype === "success") {
+        content = message.result || ""
+      }
+    }
+
+    return {
+      content,
+      duration: Date.now() - start,
+    }
+  } catch (error: any) {
+    return {
+      content: "",
+      ...buildErrorEnvelope(`SDK error: ${error.message}`),
+      duration: Date.now() - start,
+    }
+  }
+}
+
+/**
+ * Execute a task using agentx's own orchestrator (tier: "orchestrator").
+ *
+ * When `onDelta` is supplied, switches from `generate()` (single-shot) to
+ * `generateStream()` and forwards text deltas as they arrive. This is what
+ * lets the daemon's POST /chat?stream=true actually stream Claude/DeepSeek
+ * tokens — without it, the orchestrator returned only after the agentic
+ * loop finished and SSE clients saw `role` then `stop` with no content
+ * between (the failure mode that surfaced on the acme-public smoke test
+ * after the tier switch).
+ */
+/** Side-channel for reasoning/thinking chunks — distinct from
+ *  StreamCallback so callers can route them to a different UI lane
+ *  (e.g. a collapsible thinking block on example.com, a dimmed terminal
+ *  block in the dashboard) without polluting the visible response. */
+export type ThinkingCallback = (text: string) => void
+
+export async function executeOrchestrator(
+  agent: AgentDef,
+  task: AgentTask,
+  apiKey?: string,
+  historyContext?: string,
+  onDelta?: StreamCallback,
+  providerOpts?: { thinking?: boolean },
+  onThinking?: ThinkingCallback,
+  abortSignal?: AbortSignal,
+  onEvent?: (event: any) => void,
+): Promise<AgentResponse> {
+  const start = Date.now()
+
+  // Wall-clock cap. Every other tier (claude-code, codex-cli) already
+  // honours agent.maxExecutionMinutes; without it on the orchestrator
+  // path a hung provider stream or stuck tool keeps the runningTask
+  // alive forever — the registry's finally-block only fires when this
+  // function returns, and operator Stop relies on the same return.
+  // Combine the operator's abortSignal with a timer so EITHER source
+  // forces the loop to bail and the registry to clean up.
+  const timeoutMs = Math.max(60_000, (agent.maxExecutionMinutes ?? 20) * 60_000)
+  const combined = new AbortController()
+  let timedOut = false
+  const onOperatorAbort = () => {
+    const reason = (abortSignal!.reason as any)?.message
+      || (typeof abortSignal!.reason === "string" ? abortSignal!.reason : "task cancelled by operator")
+    try { combined.abort(new Error(reason)) } catch { /* */ }
+  }
+  if (abortSignal) {
+    if (abortSignal.aborted) onOperatorAbort()
+    else abortSignal.addEventListener("abort", onOperatorAbort, { once: true })
+  }
+  const wallClockTimer = setTimeout(() => {
+    timedOut = true
+    try { combined.abort(new Error(`orchestrator timed out after ${Math.round(timeoutMs / 60_000)}m`)) } catch { /* */ }
+  }, timeoutMs)
+  ;(wallClockTimer as any).unref?.()
+
+  const timeoutEnvelope = (): AgentResponse => ({
+    content: "",
+    ...buildErrorEnvelope(`Orchestrator timed out after ${Math.round(timeoutMs / 60_000)}m. Bump agent.maxExecutionMinutes for "${agent.name || "this agent"}" if tasks need longer.`),
+    duration: Date.now() - start,
+  })
+
+  try {
+    const providerName = agent.provider || "claude-code"
+
+    // Build full prompt with context (landscape, memory, patterns, etc.)
+    const fullTask = historyContext
+      ? `${historyContext}\n\n${task.message}`
+      : task.message
+
+    // Enable acme workspace tools (list_projects, create_task, etc.)
+    // when the channel is web-chat AND the sender is an acme user_id
+    // UUID. The ToolExecutor reads the bearer from env at dispatch
+    // time — it never enters the agent's prompt context. Non-acme
+    // callers (telegram numeric ids, mesh, crons) get no acmeContext
+    // so the tools are absent from their catalog entirely.
+    const sender = task.context?.sender
+    const looksUuid =
+      typeof sender === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sender)
+    const acmeContext =
+      task.context?.channel === "web-chat" && looksUuid
+        ? { userId: sender, agentId: task.agentId || "acme-public" }
+        : undefined
+
+    // MCP servers declared on this agent (including codegraph when
+    // codegraph=true) — agentx already syncs these to .mcp.json for
+    // CLI-backed tiers, but the orchestrator's in-process loop has its
+    // own hand-rolled catalog and never reads that file. startMcpPool
+    // inside generate()/generateStream() boots them as stdio children
+    // and exposes their tools to the loop.
+    const mcpServers = effectiveMcpConfig(agent)
+    const hasMcp = Object.keys(mcpServers).length > 0
+
+    const baseOpts = {
+      task: fullTask,
+      cwd: agent.workspace,
+      provider: providerName as any,
+      model: task.model || agent.model,
+      apiKey,
+      overwrite: true,
+      interactive: false,
+      context7: false,
+      acmeContext,
+      providerOpts,
+      abortSignal: combined.signal,
+      mcpServers: hasMcp ? mcpServers : undefined,
+      // Employee-mode kill-switch: strip every tool from the catalog so
+      // chat-only agents can answer but never execute anything.
+      ...(agent.noTools ? { disabledTools: [...ALL_TOOL_NAMES] } : {}),
+    }
+
+    // Propagate the agent's permissionMode to the orchestrator's global
+    // PermissionManager. Without this, file writes fall back to mode
+    // "default" which shows an interactive Yes/No prompt — in a daemon
+    // with no TTY that prompt hangs forever, freezing the whole task.
+    // "bypassPermissions" (CLI-tier concept) maps to "yolo" here.
+    {
+      const rawMode = agent.permissionMode === "bypassPermissions"
+        ? "yolo"
+        : (agent.permissionMode || "default")
+      if ((PERMISSION_MODES as readonly string[]).includes(rawMode)) {
+        globalPermissions.setMode(rawMode as PermissionMode)
+      }
+    }
+
+    if (onDelta) {
+      const { generateStream } = await import("@/agent")
+      let content = ""
+      let tokensUsed: number | undefined
+      let inputTokens: number | undefined
+      let outputTokens: number | undefined
+      let errorMsg: string | undefined
+      for await (const event of generateStream(baseOpts)) {
+        // Forward tool_call/tool_result (and a few other signal events)
+        // to the caller-supplied onEvent so the daemon's SSE writer can
+        // surface "calling wiki_search…" → "✓ wiki_search done" badges
+        // on the jort-wiki chat without parsing internal stream-json.
+        if (onEvent) {
+          try { onEvent(event) } catch { /* subscriber crashed */ }
+        }
+        if (event.type === "text_delta") {
+          content += event.text
+          onDelta(event.text, content)
+        } else if (event.type === "thinking_delta") {
+          // Route thinking to the dedicated side-channel so the chat
+          // endpoint can emit `delta.reasoning_content` (DeepSeek's
+          // own convention) and the dashboard modal can render it in
+          // a distinct lane. Keeping it out of onDelta is critical:
+          // the chat SSE consumer (example.com) treats `delta.content`
+          // as visible response text, so leaking thinking there
+          // floods the chat with `💭 the / 💭 user / …` per token.
+          if (event.text && onThinking) onThinking(event.text)
+        } else if (event.type === "generate_result") {
+          // Final canonical result — generate_result.content may include
+          // text the provider emitted as a single payload alongside
+          // tool_use, plus any files/followUp summarisation. Prefer it
+          // when it diverges from our running accumulation.
+          if (event.result.content && event.result.content !== content) {
+            const trailing = event.result.content.slice(content.length)
+            if (trailing) {
+              content = event.result.content
+              onDelta(trailing, content)
+            } else {
+              content = event.result.content
+            }
+          }
+          tokensUsed = event.result.tokensUsed
+          // Pick up split tokens so the SSE usage chunk is accurate
+          // — same shape as the non-streaming path below.
+          if (event.result.inputTokens != null) inputTokens = event.result.inputTokens
+          if (event.result.outputTokens != null) outputTokens = event.result.outputTokens
+        } else if (event.type === "done") {
+          // Non-agentic path emits `done` with the full result.
+          if (event.result.content && event.result.content !== content) {
+            const trailing = event.result.content.slice(content.length)
+            if (trailing) {
+              content = event.result.content
+              onDelta(trailing, content)
+            } else {
+              content = event.result.content
+            }
+          }
+          if (event.result.tokensUsed != null) tokensUsed = event.result.tokensUsed
+        } else if (event.type === "error") {
+          errorMsg = event.error
+        }
+      }
+      if (errorMsg && !content) {
+        // Wall-clock cap fired — surface as a `timeout` envelope so
+        // operators see the same "timed out after Xm" message every
+        // other tier produces.
+        if (timedOut) return timeoutEnvelope()
+        // Operator-cancel: surface the same `errorKind: "cancelled"`
+        // envelope claude-code uses, so the router / channel layer
+        // suppresses the error echo and the registry's finally block
+        // can route follow-ups normally.
+        if (errorMsg === "cancelled" || abortSignal?.aborted || combined.signal.aborted) {
+          return {
+            content: "",
+            error: "task cancelled by operator",
+            errorKind: "cancelled",
+            duration: Date.now() - start,
+          }
+        }
+        return {
+          content: "",
+          ...buildErrorEnvelope(`Orchestrator error: ${errorMsg}`),
+          duration: Date.now() - start,
+        }
+      }
+      // Fallback estimate so the SSE usage chunk on the daemon /chat
+      // path always has SOME values for example.com's cost-based billing
+      // to work against (the floor still protects against undercharge).
+      if ((inputTokens === undefined || outputTokens === undefined) && tokensUsed) {
+        inputTokens = Math.round(tokensUsed * 0.7)
+        outputTokens = tokensUsed - inputTokens
+      }
+      return {
+        content: content || "Done.",
+        tokensUsed,
+        usage: (inputTokens !== undefined || outputTokens !== undefined)
+          ? { inputTokens: inputTokens || 0, outputTokens: outputTokens || 0, cacheReadTokens: 0, cacheCreateTokens: 0 }
+          : undefined,
+        duration: Date.now() - start,
+      }
+    }
+
+    // Non-streaming path — unchanged from the original orchestrator
+    // behaviour so existing callers (telegram, mesh, crons) keep working.
+    const { generate } = await import("@/agent")
+    const result = await generate(baseOpts)
+    // Surface split tokens on `usage` so the daemon /chat handler (and
+    // its example.com voice forwarder) can do cost-based billing instead
+    // of the floor-only fallback. Falls back to a 30/70 estimate when
+    // the provider only reports a combined total (CLI tier, legacy
+    // loop) so downstream billing never sees zeros for a real turn.
+    let inputTokens = result.inputTokens
+    let outputTokens = result.outputTokens
+    if ((inputTokens === undefined || outputTokens === undefined) && result.tokensUsed) {
+      const total = result.tokensUsed
+      inputTokens = Math.round(total * 0.7)
+      outputTokens = total - inputTokens
+    }
+    return {
+      content: result.content || "Done.",
+      tokensUsed: result.tokensUsed,
+      usage: (inputTokens !== undefined || outputTokens !== undefined)
+        ? { inputTokens: inputTokens || 0, outputTokens: outputTokens || 0, cacheReadTokens: 0, cacheCreateTokens: 0 }
+        : undefined,
+      duration: Date.now() - start,
+    }
+  } catch (error: any) {
+    if (timedOut) return timeoutEnvelope()
+    // `generate()` (non-streaming) throws "cancelled" from the agentic
+    // loop's iteration_start check when the combined signal fires.
+    if (error?.message === "cancelled" || abortSignal?.aborted || combined.signal.aborted) {
+      return {
+        content: "",
+        error: "task cancelled by operator",
+        errorKind: "cancelled",
+        duration: Date.now() - start,
+      }
+    }
+    return {
+      content: "",
+      ...buildErrorEnvelope(`Orchestrator error: ${error.message}`),
+      duration: Date.now() - start,
+    }
+  } finally {
+    clearTimeout(wallClockTimer)
+    if (abortSignal) abortSignal.removeEventListener("abort", onOperatorAbort)
+  }
+}
+
+/**
+ * Route a task to the correct execution tier.
+ */
+/**
+ * Execute a task by reusing a persistent claude subprocess held in the
+ * ProcessRegistry. Driven over `--input-format stream-json` on stdin;
+ * the same parser path handles output. See
+ * docs/architecture/persistent-claude-process.md for the design.
+ *
+ * Forwards every stream event to `onEvent` so the existing trace
+ * capture site (registry.ts emitTraceStepsFromStreamEvent) continues
+ * to populate task_trace_steps unchanged.
+ *
+ * Returns null when the registry can't allocate a slot (cap exceeded,
+ * binary not installed, etc.) — caller falls back to spawn-per-task.
+ */
+/** Grace the CLI gets to exit on its own after its terminal event before
+ *  the reply proceeds without it. */
+const POST_RESULT_EXIT_GRACE_MS = 1_000
+
+/**
+ * Resolve with the process result when it exits, or with a synthetic clean
+ * exit once the terminal event has been seen and the grace has passed. The
+ * child keeps running unattended in the latter case; it exits on its own.
+ */
+async function settleAfterResult(proc: PromiseLike<any>, resultSeen: Promise<void>): Promise<any> {
+  const exited = Promise.resolve(proc).then((r) => ({ kind: "exit" as const, r }))
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const graced = resultSeen.then(() => new Promise<{ kind: "grace" }>((res) => {
+    timer = setTimeout(() => res({ kind: "grace" }), POST_RESULT_EXIT_GRACE_MS)
+    timer.unref?.()
+  }))
+  const first = await Promise.race([exited, graced])
+  if (timer) clearTimeout(timer)
+  if (first.kind === "exit") return first.r
+  exited.catch(() => {})
+  return { exitCode: 0, stdout: "", stderr: "", detachedAfterResult: true }
+}
+
+async function executeClaudeCodePersistent(
+  agent: AgentDef,
+  task: AgentTask,
+  historyContext?: string,
+  resumeSessionId?: string,
+  onEvent?: (event: any) => void,
+  abortSignal?: AbortSignal,
+  onDelta?: StreamCallback,
+): Promise<AgentResponse | null> {
+  const registry = getProcessRegistry()
+  if (!registry) return null
+
+  const start = Date.now()
+  const channel = task.context?.channel || "api"
+  const chatId = task.context?.chatId || task.context?.group || task.context?.sender || "default"
+  const key: ProcessKey = { agentId: task.agentId, channel, chatId }
+
+  // Improvement plan #8 — caller-driven session reset for the
+  // persistent path. Kill any existing handle BEFORE acquire so the
+  // next call spawns a brand-new subprocess instead of reusing the
+  // warm one. Awaiting the kill keeps acquire-after-kill race-free:
+  // the registry entry is removed inside kill() before resolution.
+  if (task.freshSession) {
+    try { await registry.kill(key, "freshSession=true") } catch { /* observability best-effort */ }
+  }
+
+  let handle
+  let wasFreshSpawn = false
+  try {
+    const before = registry.list().length
+    handle = registry.acquire(key, {
+      agentId: task.agentId,
+      channel,
+      chatId,
+      workspace: agent.workspace,
+      model: task.model || agent.model,
+      permissionMode: agent.permissionMode,
+      billing: agent.billing,
+      systemPromptAppend: task.systemPromptAppend,
+      resumeSessionId,
+    })
+    wasFreshSpawn = registry.list().length > before
+  } catch (e: any) {
+    if (e instanceof RegistryCapExceeded) return null
+    // Anything else — return null too; caller falls back. Persistent
+    // path must never be more brittle than the spawn-per-task one.
+    return null
+  }
+  // Audit log only on fresh spawns — reused handles already audited at
+  // their original spawn. Cuts noise on chats that turn frequently.
+  if (wasFreshSpawn) {
+    logClaudeSpawn(task.agentId, agent, task.model, resumeSessionId, "persistent")
+  }
+
+  const prompt = buildPrompt(agent, task, historyContext)
+
+  // Accumulate response data from the stream events. Mirrors what
+  // parseClaudeJsonOutput does for the spawn-per-task JSON envelope.
+  let finalText = ""
+  let finalError: string | undefined
+  let finalErrorKind: FriendlyError["kind"] | undefined
+  let usage: TokenUsage | undefined
+  let contextTokens: number | undefined
+  let numTurns: number | undefined
+  let billedModel: string | undefined
+  let sessionId: string | undefined
+  // Text already forwarded to onDelta. Each assistant event carries one
+  // message; a snapshot that extends the current message yields only its
+  // suffix, and a new message after tool use starts a new paragraph.
+  let streamedText = ""
+  let messageText = ""
+  const emitText = (text: string) => {
+    if (!onDelta || !text) return
+    let delta: string
+    if (messageText && text.startsWith(messageText)) {
+      delta = text.slice(messageText.length)
+    } else {
+      delta = streamedText && !streamedText.endsWith("\n") ? `\n\n${text}` : text
+    }
+    messageText = text
+    if (!delta) return
+    streamedText += delta
+    try { onDelta(delta, streamedText) } catch { /* caller crash must not break the turn */ }
+  }
+
+  // Operator cancellation for the persistent path. Killing the handle
+  // closes its stdio, which terminates the async iterator below; we then
+  // emit a "cancelled" envelope just like the spawn-per-task paths.
+  let cancelled = false
+  const onAbort = () => {
+    cancelled = true
+    void registry.kill(key, "operator-cancel").catch(() => {})
+  }
+  if (abortSignal) {
+    if (abortSignal.aborted) onAbort()
+    else abortSignal.addEventListener("abort", onAbort, { once: true })
+  }
+
+  let sawEvent = false
+  try {
+    const turnBudgetMs = Math.max(60_000, (agent.maxExecutionMinutes ?? 20) * 60_000)
+    for await (const evt of handle.runTurn({ message: prompt, taskId: task.taskId ?? "unknown", deadlineMs: turnBudgetMs })) {
+      sawEvent = true
+      // Forward to existing onEvent — trace step emitter, dashboard
+      // formatter, etc. all keep working without changes.
+      if (onEvent) {
+        try { onEvent(evt.raw) } catch { /* observability best-effort */ }
+      }
+
+      if (evt.type === "assistant") {
+        // Assistant snapshots are cumulative — overwrite, don't append.
+        const blocks = ((evt.raw as any).message?.content ?? []) as Array<{ type: string; text?: string }>
+        for (const block of blocks) {
+          if (block.type === "text" && typeof block.text === "string") {
+            finalText = block.text
+            emitText(block.text)
+          } else if (block.type === "tool_use") {
+            messageText = ""
+          }
+        }
+        // Per-call usage on the assistant envelope: the last call's
+        // (input + cache) tokens = end-of-turn context size. See
+        // AgentResponse.contextTokens for why this, not the cumulative
+        // result usage, drives session rotation.
+        const u = (evt.raw as any).message?.usage
+        if (u) {
+          const callContext =
+            (u.input_tokens || 0) +
+            (u.cache_read_input_tokens || 0) +
+            (u.cache_creation_input_tokens || 0)
+          if (callContext > 0) contextTokens = callContext
+        }
+      }
+
+      if (evt.type === "result") {
+        const r = evt.raw as any
+        if (r.is_error) {
+          const env = buildErrorEnvelope(typeof r.result === "string" ? r.result : "claude error")
+          finalError = env.error
+          finalErrorKind = env.errorKind
+        } else if (typeof r.result === "string" && r.result.length > 0) {
+          // Final result text (sometimes more authoritative than the last
+          // assistant snapshot, especially for very short responses).
+          finalText = r.result
+          if (!streamedText) emitText(r.result)
+        }
+        if (typeof r.session_id === "string") sessionId = r.session_id
+        if (r.usage) {
+          usage = {
+            inputTokens: r.usage.input_tokens || 0,
+            outputTokens: r.usage.output_tokens || 0,
+            cacheReadTokens: r.usage.cache_read_input_tokens || 0,
+            cacheCreateTokens: r.usage.cache_creation_input_tokens || 0,
+          }
+        }
+        if (typeof r.num_turns === "number") numTurns = r.num_turns
+        if (typeof (r.message?.model) === "string") billedModel = r.message.model
+        else if (typeof r.model === "string") billedModel = r.model
+      }
+    }
+  } catch (e: any) {
+    if (cancelled) {
+      finalError = "task cancelled by operator"
+      finalErrorKind = "cancelled"
+    } else if (!sawEvent) {
+      // Turn never started (handle killed between acquire and the first
+      // write, stdin gone, etc.) — nothing streamed, so retrying is
+      // side-effect-free. Return null and let the caller fall back to
+      // spawn-per-task; an infra race must not surface as a task failure.
+      console.error(`[runtime] persistent handle unusable before first event (${e?.message || e}); falling back to spawn-per-task`)
+      registry.release(key, { kill: true, reason: "pre-turn failure" })
+      if (abortSignal) abortSignal.removeEventListener("abort", onAbort)
+      return null
+    } else if (e instanceof TurnInterrupted) {
+      // Killed from outside the turn (daemon shutdown, eviction). Not a
+      // timeout: raising maxExecutionMinutes would not have saved it.
+      finalError = `Claude Code was stopped mid-turn (${e.reason}), before its time limit`
+      finalErrorKind = "interrupted"
+    } else if (e instanceof TurnDeadlineExceeded) {
+      const env = buildErrorEnvelope(`Claude Code timed out after ${Math.round(e.budgetMs / 60_000)}m. Bump agent.maxExecutionMinutes for "${agent.name || task.agentId}" if tasks need longer.`)
+      finalError = env.error
+      finalErrorKind = env.errorKind
+    } else {
+      const env = buildErrorEnvelope(`persistent claude process error: ${e?.message || String(e)}`)
+      finalError = env.error
+      finalErrorKind = env.errorKind
+    }
+  } finally {
+    if (abortSignal) abortSignal.removeEventListener("abort", onAbort)
+  }
+
+  if (cancelled && !finalError) {
+    finalError = "task cancelled by operator"
+    finalErrorKind = "cancelled"
+  }
+
+  return {
+    content: cancelled ? "" : finalText,
+    error: finalError,
+    errorKind: finalErrorKind,
+    duration: Date.now() - start,
+    usage,
+    contextTokens,
+    numTurns,
+    billedModel,
+    claudeSessionId: sessionId,
+  }
+}
+
+/** Autonomy flags for a claude spawn. Restricted tasks always carry a
+ *  taskId by the time they get here (executeRestrictedTask assigns one). */
+function restrictedClaudeArgs(task: AgentTask): { args: string[] } | { error: string } {
+  if (!isRestricted(task.autonomy)) return { args: [] }
+  if (!task.taskId) return { error: `autonomy "${task.autonomy}" requires a task id to enforce` }
+  return autonomyClaudeArgs(task.autonomy, task.agentId, task.taskId)
+}
+
+/**
+ * Run a task under a restricted autonomy level (report | propose).
+ *
+ * Always a fresh spawn-per-task claude process carrying the autonomy hook:
+ * a warm persistent process was spawned without it (and serves other turns
+ * of the chat), so reusing it would silently skip enforcement. Session
+ * continuity survives through --resume. Tiers that cannot carry the hook
+ * refuse rather than run at full power.
+ */
+async function executeRestrictedTask(
+  agent: AgentDef,
+  task: AgentTask,
+  onDelta?: StreamCallback,
+  historyContext?: string,
+  resumeSessionId?: string,
+  onEvent?: (event: any) => void,
+  abortSignal?: AbortSignal,
+): Promise<AgentResponse> {
+  const level = task.autonomy!
+  const unsupported = autonomyUnsupported(level, agent.tier)
+  if (unsupported) return { content: "", error: unsupported, autonomy: level }
+  const taskId = task.taskId || `autonomy-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  const restricted: AgentTask = { ...task, taskId, message: `${autonomyBrief(level)}\n\n${task.message}` }
+  process.stderr.write(`[claude-autonomy] agent=${task.agentId} level=${level} task=${taskId} via=spawn (persistent process bypassed)\n`)
+  const response = onDelta
+    ? await executeClaudeCodeStreaming(agent, restricted, onDelta, historyContext, resumeSessionId, onEvent, abortSignal)
+    : await executeClaudeCode(agent, restricted, historyContext, resumeSessionId, abortSignal)
+  const blocks = takeAutonomyBlocks(taskId)
+  return { ...response, autonomy: level, ...(blocks.length ? { autonomyBlocks: blocks } : {}) }
+}
+
+export async function executeTask(
+  agent: AgentDef,
+  task: AgentTask,
+  providers: Record<string, { apiKey?: string }>,
+  onDelta?: StreamCallback,
+  historyContext?: string,
+  resumeSessionId?: string,
+  onEvent?: (event: any) => void,
+  abortSignal?: AbortSignal,
+  onThinking?: ThinkingCallback,
+): Promise<AgentResponse> {
+  if (isRestricted(task.autonomy)) {
+    return executeRestrictedTask(agent, task, onDelta, historyContext, resumeSessionId, onEvent, abortSignal)
+  }
+  switch (agent.tier) {
+    case "claude-code":
+      // Persistent-process path (improvement plan #5, persistent flavor).
+      // Returns null when the registry isn't available or can't allocate
+      // a slot — we fall through to the legacy spawn-per-task path so
+      // a registry-only failure can never block dispatch.
+      if (agent.persistentProcess) {
+        const persistent = await executeClaudeCodePersistent(agent, task, historyContext, resumeSessionId, onEvent, abortSignal, onDelta)
+        if (persistent !== null) return persistent
+      }
+      if (onDelta) {
+        return executeClaudeCodeStreaming(agent, task, onDelta, historyContext, resumeSessionId, onEvent, abortSignal)
+      }
+      return executeClaudeCode(agent, task, historyContext, resumeSessionId, abortSignal)
+
+    case "codex-cli":
+      if (agent.persistentProcess) {
+        try {
+          const result = await codexProcessPool.run({
+            key: JSON.stringify([task.agentId, task.context?.channel, task.context?.chatId]),
+            cwd: agent.workspace, env: buildRuntimeEnv(agent, task),
+            args: buildCodexAgentxMcpArgs(), model: task.model || agent.model,
+            bypass: agent.permissionMode === "bypassPermissions",
+            prompt: buildCodexPrompt(buildPrompt(agent, task, historyContext), task.systemPromptAppend),
+            resume: resumeSessionId, fresh: task.freshSession,
+            timeoutMs: Math.max(60_000, (agent.maxExecutionMinutes ?? 20) * 60_000),
+            signal: abortSignal, onEvent, onDelta,
+          })
+          return { ...result, ...(result.error ? buildErrorEnvelope(result.error) : {}) }
+        } catch (error) {
+          if (!(error instanceof CodexUnavailable)) throw error
+          onEvent?.({ type: "codex.fallback", reason: error.message })
+          if (abortSignal?.aborted) return { content: "", error: "task cancelled by operator", errorKind: "cancelled" }
+        }
+      }
+      if (onDelta) {
+        return executeCodexCliStreaming(agent, task, onDelta, historyContext, resumeSessionId, onEvent)
+      }
+      return executeCodexCli(agent, task, historyContext, resumeSessionId)
+
+    case "opencode":
+      return executeOpenCodeCli(agent, task, onDelta, historyContext, resumeSessionId, onEvent, abortSignal, onThinking)
+
+    case "sdk": {
+      const providerName = agent.provider || "claude"
+      const apiKey = providers[providerName]?.apiKey
+      if (!apiKey) {
+        return {
+          content: "",
+          error: `No API key for provider "${providerName}". Configure providers.${providerName}.apiKey`,
+        }
+      }
+      return executeSdk(agent, task, apiKey, historyContext)
+    }
+
+    case "orchestrator": {
+      const providerName = agent.provider || "claude-code"
+      const providerCfg = providers[providerName]
+      const apiKey = providerCfg?.apiKey
+      return executeOrchestrator(agent, task, apiKey, historyContext, onDelta, {
+        thinking: (providerCfg as any)?.thinking,
+      }, onThinking, abortSignal, onEvent)
+    }
+
+    default:
+      return {
+        content: "",
+        error: `Unknown tier: ${agent.tier}`,
+      }
+  }
+}

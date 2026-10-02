@@ -1,0 +1,2187 @@
+import type { DaemonConfig } from "@/daemon/config"
+import type { AgentRegistry } from "@/agents/registry"
+import type { A2AMesh } from "@/a2a/mesh"
+import type { ChannelAdapter, IncomingMessage, OutgoingMessage } from "./types"
+import type { TelegramAdapter } from "./telegram"
+import type { GitLabAdapter } from "./gitlab"
+import type { HookRegistry } from "@/hooks"
+import { GroupLog } from "./group-log"
+import { HandoverStore, type HandoverOverride } from "./handover-store"
+import { BlockStream } from "./block-stream"
+import { StreamingMessage } from "./streaming-message"
+import { splitMessageText, TG_CHUNK_CHARS } from "./message-chunks"
+import { ellipsize, firstLines } from "@/utils/ellipsize"
+import type { ServiceMatcher } from "@/services/matcher"
+import type { BusinessLayer } from "@/business"
+import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, statSync, unlinkSync } from "fs"
+import { resolve, dirname, join, extname } from "path"
+import { createHash } from "crypto"
+import { fromIncoming, type InboundEnvelope } from "./inbound/envelope"
+import { runPipeline, type PipelineResult } from "./inbound/pipeline"
+import { defaultPipeline } from "./inbound/stages"
+import { pickAccountForAgent } from "./account-resolution"
+import { getEventBus } from "@/events/bus"
+import { withNewRoot } from "@/events/envelope"
+import { getLedgerMode } from "@/intent/mode"
+import { getDefaultLedger } from "@/intent/instance"
+import { recordRouterDispatch, routerChannelToSource } from "@/intent/sources/router"
+import type { LegacyOutcome } from "@/intent/divergence"
+import type { IntentResolutionStatus } from "@/intent/types"
+import { parseQueued, type QueuedAnswer } from "@/agents/queued"
+import { unwrapMeshError } from "@/a2a/mesh-errors"
+import { extractUiDirective, stripUiDirectiveForPreview, type UiDirective } from "./ui-directive"
+import type { Resumer } from "@/agents/resume/coordinator"
+
+/** During streaming, hide a partial or complete `agentx:ui` directive block so
+ *  a half-written fence never flashes as raw text in the live preview. The
+ *  final render (extractUiDirective) does the authoritative strip. */
+function previewText(full: string): string {
+  return stripUiDirectiveForPreview(full)
+}
+
+/** Map a parsed `agentx:ui` directive onto an OutgoingMessage's rich fields. */
+function uiToOutgoing(ui: UiDirective): Pick<OutgoingMessage, "buttons" | "poll" | "media"> {
+  const out: Pick<OutgoingMessage, "buttons" | "poll" | "media"> = {}
+  if (ui.buttons) out.buttons = ui.buttons
+  if (ui.poll) out.poll = { name: ui.poll.question, values: ui.poll.options, selectableCount: ui.poll.multiple ? ui.poll.options.length : 1 }
+  if (ui.media) out.media = ui.media
+  return out
+}
+
+// --- Agent outbox delivery (Telegram) ---
+// Deliverable files an agent creates for the user are copied into
+// <workspace>/.agentx/outbox/ (the long-standing "show the owner this file"
+// convention). For Telegram chats the router drains new outbox entries after
+// each task and sends them into the chat, so a poster/PDF the employee made
+// actually lands in the group instead of only being mentioned in text.
+const OUTBOX_IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"])
+const OUTBOX_VIDEO_EXTS = new Set([".mp4", ".mov", ".webm"])
+const OUTBOX_AUDIO_EXTS = new Set([".mp3", ".ogg", ".wav", ".m4a"])
+const OUTBOX_MAX_FILES = 5
+const OUTBOX_MAX_BYTES = 49 * 1024 * 1024 // Telegram bot upload ceiling is 50MB
+
+function outboxDirFor(workspace: string | undefined): string | null {
+  if (!workspace) return null
+  try {
+    return join(resolve(process.cwd(), workspace), ".agentx", "outbox")
+  } catch {
+    return null
+  }
+}
+
+/** name -> mtimeMs for files currently in the outbox (flat, files only). */
+function snapshotOutbox(dir: string | null): Map<string, number> {
+  const snap = new Map<string, number>()
+  if (!dir) return snap
+  try {
+    for (const name of readdirSync(dir)) {
+      try {
+        const st = statSync(join(dir, name))
+        if (st.isFile()) snap.set(name, st.mtimeMs)
+      } catch { /* raced away */ }
+    }
+  } catch { /* no outbox yet */ }
+  return snap
+}
+
+function outboxMediaType(name: string): "image" | "document" | "audio" | "video" {
+  const ext = extname(name).toLowerCase()
+  if (OUTBOX_IMAGE_EXTS.has(ext)) return "image"
+  if (OUTBOX_VIDEO_EXTS.has(ext)) return "video"
+  if (OUTBOX_AUDIO_EXTS.has(ext)) return "audio"
+  return "document"
+}
+
+/**
+ * Crash-safe inflight task log. Every message we commit to handling is
+ * appended as a `start` entry to .agentx/router/inflight.jsonl. When the
+ * handler returns (success OR error), we append a matching `done` entry.
+ *
+ * On daemon boot, any `start` without a `done` is replayed through the
+ * handler with a `replay` flag that bypasses dedup — because a crash
+ * between start and done means the user never got a reply.
+ *
+ * Trade-off vs always replaying: we only resume work that was IN PROGRESS
+ * at crash time. Genuine handler failures (task returned an error) still
+ * get their `done` marker and are NOT retried — so we don't infinite-loop
+ * on a poison-pill message.
+ */
+interface InflightStart {
+  type: "start"
+  id: string
+  channel: string
+  accountId: string
+  text: string
+  sender: IncomingMessage["sender"]
+  group?: IncomingMessage["group"]
+  replyTo?: string
+  replyToText?: string
+  timestamp: string
+  resolvedAgent?: string
+  preferNode?: string
+  ts: number
+}
+
+class InflightLog {
+  private filePath: string
+
+  constructor(baseDir: string) {
+    this.filePath = resolve(baseDir, ".agentx/router/inflight.jsonl")
+    mkdirSync(dirname(this.filePath), { recursive: true })
+  }
+
+  start(entry: Omit<InflightStart, "type" | "ts">): void {
+    try {
+      const line = JSON.stringify({ type: "start", ts: Date.now(), ...entry }) + "\n"
+      appendFileSync(this.filePath, line)
+    } catch { /* best-effort persistence */ }
+  }
+
+  done(id: string): void {
+    try {
+      appendFileSync(this.filePath, JSON.stringify({ type: "done", id, ts: Date.now() }) + "\n")
+    } catch { /* */ }
+  }
+
+  /** Scan the log and return all `start` entries without a matching `done`. */
+  loadUnfinished(): InflightStart[] {
+    if (!existsSync(this.filePath)) return []
+    try {
+      const raw = readFileSync(this.filePath, "utf-8")
+      const byId = new Map<string, InflightStart>()
+      for (const line of raw.split("\n")) {
+        if (!line.trim()) continue
+        try {
+          const entry = JSON.parse(line) as { type: string; id: string } & InflightStart
+          if (entry.type === "start") byId.set(entry.id, entry as InflightStart)
+          else if (entry.type === "done") byId.delete(entry.id)
+        } catch { /* skip corrupt line */ }
+      }
+      return [...byId.values()]
+    } catch { return [] }
+  }
+
+  /** Rewrite the file with only currently-unfinished entries. Call on graceful
+   *  stop or periodically — keeps the file from growing without bound. */
+  compact(): void {
+    try {
+      const unfinished = this.loadUnfinished()
+      const out = unfinished.map((e) => JSON.stringify(e)).join("\n") + (unfinished.length ? "\n" : "")
+      writeFileSync(this.filePath, out)
+    } catch { /* */ }
+  }
+}
+
+/** The parts of an incoming message needed to handle it again after a
+ *  restart (same shape the inflight log keeps, plus adapter context). */
+export function serializeIncoming(msg: IncomingMessage): Record<string, unknown> {
+  return {
+    id: msg.id, channel: msg.channel, accountId: msg.accountId, sender: msg.sender, group: msg.group,
+    text: msg.text, replyTo: msg.replyTo, replyToText: msg.replyToText,
+    timestamp: (msg.timestamp instanceof Date ? msg.timestamp : new Date()).toISOString(),
+    resolvedAgent: msg.resolvedAgent, preferNode: msg.preferNode, channelMeta: msg.channelMeta,
+    runbookPath: msg.runbookPath, runbookFiles: msg.runbookFiles, media: msg.media,
+  }
+}
+
+function incomingFrom(stored: Record<string, any>): IncomingMessage {
+  return {
+    ...(stored as any),
+    timestamp: new Date(stored.timestamp ?? Date.now()),
+  }
+}
+
+// --- Message Router ---
+// Routes channel messages to agents. Supports:
+// - Typing indicator while processing
+// - Streaming response edits
+// - Seen reaction (👀) on mention
+// - Bot-to-bot: if response mentions another agent, route it
+// - Correct bot account sends the reply (not always the first one)
+
+const STREAM_EDIT_INTERVAL_MS = 1500
+const TYPING_INTERVAL_MS = 4000
+
+/**
+ * Strip mesh plumbing from an error so a thread sees the real cause and not
+ * our internal peer names / status codes. Mesh errors arrive nested — a
+ * fallback hop wraps the origin peer's message, e.g.
+ *   Peer "a" /task error: 500: mesh fallback failed: Peer "b" /task error: 500: <real cause>
+ * so the peel runs until it stops making progress.
+ *
+ * Also drops the friendly "AgentX will retry in a moment" tail: by the time we
+ * post a failure notice the per-task attempts are already spent, and promising
+ * a retry that will not happen is worse than saying nothing. Other `fix`
+ * clauses (enable overage, top up credits) are genuinely actionable, so they
+ * stay.
+ */
+export function cleanMeshError(raw: string): string {
+  return unwrapMeshError(raw).replace(/\s*[—-]\s*AgentX will retry[^.]*\.?\s*$/i, "").trim()
+}
+
+/** One inbound message held while its target mesh peer is unreachable.
+ *  Keeps the adapter reference so replay can answer on the original
+ *  channel/thread without re-resolving it. */
+interface DeferredMeshMessage {
+  key: string
+  adapter: ChannelAdapter
+  msg: IncomingMessage
+  agentId: string
+  peerName: string
+  deferredAt: number
+}
+
+export class MessageRouter {
+  private registry: AgentRegistry
+  private config: DaemonConfig
+  private channels: Map<string, ChannelAdapter> = new Map()
+  private hooks?: HookRegistry
+  private mesh?: A2AMesh
+  private serviceMatcher?: ServiceMatcher
+  private business?: BusinessLayer
+  private groupLog: GroupLog
+  /** Runtime per-chat routing overrides (handovers). Consulted at the top
+   *  of resolveAgent; config routes + mention matching only run when no
+   *  override applies. */
+  private handoverStore: HandoverStore
+  private log: (...args: unknown[]) => void
+
+  /** Exposed so the admin panel + registry can share the same store. */
+  getHandoverStore(): HandoverStore { return this.handoverStore }
+
+  /**
+   * Short-TTL cache of recently processed incoming message IDs, keyed by
+   * `<channel>:<accountId>:<id>`. Prevents duplicate replies from:
+   *   - GitLab webhook retries (same object_attributes.id redelivered)
+   *   - WhatsApp Baileys double-emitting messages.upsert (notify + append)
+   *   - Telegram polling re-delivering an update after a long-poll hiccup
+   *   - A daemon crash-loop replaying messages the previous process had
+   *     already handled (fixed by persisting this map to disk — see below)
+   *
+   * The key INCLUDES accountId so two bots in the same Telegram group
+   * (different accountId) both get to run their routing logic — the router's
+   * downstream boundAccount check then picks the one bot that should actually
+   * reply. Without accountId in the key, the second bot's legitimate view of
+   * the same Telegram message_id would be wrongly suppressed.
+   *
+   * Persisted to .agentx/router/dedup.json so survival-across-restart is not
+   * just a Telegram concern — the same universal LRU covers every channel.
+   * Writes are debounced (every 20 new ids, or 5s, whichever first) and the
+   * file is pruned to only live TTL entries before each write.
+   */
+  private recentMessageIds: Map<string, number> = new Map()
+  private activeMessageKeys: Set<string> = new Set()
+  /** Outbound idempotency table — opt-in via sendOutbound(opts.idempotencyKey).
+   *  Key: `channel|chatId|hash-or-key`. Value: { postedAt epochMs, messageId }.
+   *  Bounded growth — coarse "drop oldest 10%" sweep when over the cap. */
+  private sendDedupeMap: Map<string, { postedAt: number; messageId: string | null }> = new Map()
+  private readonly SEND_DEDUPE_MAX = 5_000
+  private readonly MESSAGE_ID_TTL_MS = 5 * 60 * 1000
+  private readonly MESSAGE_ID_MAX_ENTRIES = 2000
+  private readonly DEDUP_STORE_PATH = ".agentx/router/dedup.json"
+  private dedupDirtyCount = 0
+  private dedupSaveTimer?: ReturnType<typeof setTimeout>
+
+  /** Crash-safe inflight log (see InflightLog class above). */
+  private inflight: InflightLog
+
+  /** In-flight mesh forwards (this node is awaiting a peer's response).
+   *  Counted so the daemon's shutdown drain can wait for these in addition
+   *  to local agent tasks — otherwise a peer restart mid-forward kills the
+   *  awaiter, the peer's response lands on a dead connection, and the
+   *  inflight-replay re-runs the task on the peer. */
+  private activeMeshForwards = 0
+  getActiveMeshForwardCount(): number { return this.activeMeshForwards }
+
+  /** Messages addressed to an agent on a mesh peer that was unreachable at
+   *  the moment they arrived, keyed by peer name, replayed when the peer
+   *  comes back.
+   *
+   *  Before this existed a peer flap was silently destructive: the routing
+   *  pipeline saw an agent that no healthy peer advertised, called it
+   *  `unknown_agent`, and dropped the message for good. The mesh recovers on
+   *  its own within a probe cycle (~60s), but nothing replayed what was lost
+   *  in between, so the person who @-mentioned the agent just watched it
+   *  ignore them. Deliberately in-memory: a daemon restart drops the queue,
+   *  which is the safe direction — a stale replay is worse than a miss.
+   *  Bounded by both age and count so a peer that never returns cannot grow
+   *  it without limit. */
+  private deferredByPeer: Map<string, DeferredMeshMessage[]> = new Map()
+  private readonly MESH_DEFER_TTL_MS = 30 * 60 * 1000
+  private readonly MESH_DEFER_MAX_PER_PEER = 50
+
+  constructor(
+    registry: AgentRegistry,
+    config: DaemonConfig,
+    hooks?: HookRegistry,
+    log: (...args: unknown[]) => void = console.error.bind(console, "[router]"),
+  ) {
+    this.registry = registry
+    this.config = config
+    this.hooks = hooks
+    this.log = log
+    this.groupLog = new GroupLog()
+    this.handoverStore = new HandoverStore({ log: (...a) => log("[handover]", ...a) })
+    this.inflight = new InflightLog(process.cwd())
+    this.loadDedupFromDisk()
+  }
+
+  private loadDedupFromDisk(): void {
+    try {
+      const p = resolve(process.cwd(), this.DEDUP_STORE_PATH)
+      if (!existsSync(p)) return
+      const raw = JSON.parse(readFileSync(p, "utf-8")) as Record<string, number>
+      const now = Date.now()
+      let restored = 0
+      for (const [key, ts] of Object.entries(raw)) {
+        if (typeof ts === "number" && now - ts < this.MESSAGE_ID_TTL_MS) {
+          this.recentMessageIds.set(key, ts)
+          restored++
+        }
+      }
+      if (restored > 0) {
+        this.log(`Router dedup: restored ${restored} recent message ids from disk`)
+      }
+    } catch {
+      // Corrupt file — start fresh, not worth failing startup over
+    }
+  }
+
+  private scheduleDedupSave(): void {
+    this.dedupDirtyCount++
+    // Fast flush on bursty traffic (every 20 new ids) plus a 5s debounce
+    // safety net for slow-trickle activity so we never lose more than a few
+    // seconds of entries in a hard crash.
+    if (this.dedupDirtyCount >= 20) {
+      this.flushDedupToDisk()
+      return
+    }
+    if (this.dedupSaveTimer) return
+    this.dedupSaveTimer = setTimeout(() => this.flushDedupToDisk(), 5000)
+  }
+
+  private flushDedupToDisk(): void {
+    if (this.dedupSaveTimer) {
+      clearTimeout(this.dedupSaveTimer)
+      this.dedupSaveTimer = undefined
+    }
+    this.dedupDirtyCount = 0
+    try {
+      const now = Date.now()
+      const live: Record<string, number> = {}
+      for (const [key, ts] of this.recentMessageIds) {
+        if (now - ts < this.MESSAGE_ID_TTL_MS) live[key] = ts
+      }
+      const p = resolve(process.cwd(), this.DEDUP_STORE_PATH)
+      const dir = dirname(p)
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+      writeFileSync(p, JSON.stringify(live))
+    } catch {
+      // Best-effort — a failed write means at-most-restart-window of replays,
+      // not a correctness problem.
+    }
+  }
+
+  /** Called by the daemon on graceful shutdown so no in-memory ids are lost. */
+  flushPersistence(): void {
+    this.flushDedupToDisk()
+    // Compact the inflight log so the file doesn't grow unboundedly across
+    // clean restarts. A crash skips this; the next boot just reads the
+    // untrimmed log and does the same replay — still correct, just slightly
+    // slower on the first scan.
+    this.inflight.compact()
+  }
+
+  setMesh(mesh: A2AMesh): void {
+    this.mesh = mesh
+    // Replay anything that arrived while this peer was unreachable. The
+    // mesh fans out to every listener, so this coexists with the daemon's
+    // EventBus bridge.
+    mesh.onPeerChange((e) => {
+      if (e.delta === "recovered") void this.replayDeferred(e.peer)
+    })
+  }
+
+  setServiceMatcher(matcher: ServiceMatcher): void {
+    this.serviceMatcher = matcher
+  }
+
+  /** Accessor so the daemon reload path can call matcher.reload() without
+   *  holding a duplicate reference. Returns undefined if services were
+   *  empty at boot. */
+  getServiceMatcher(): ServiceMatcher | undefined {
+    return this.serviceMatcher
+  }
+
+  setBusiness(business: BusinessLayer): void {
+    this.business = business
+  }
+
+  /** Swap the live DaemonConfig reference after a hot-reload. Router reads
+   *  from this.config at send-time for things like per-account Telegram token
+   *  resolution, default agents, and policy allowlists — so any /reload that
+   *  touches channels must call this to avoid sending from a stale snapshot. */
+  updateConfig(next: DaemonConfig): void {
+    this.config = next
+  }
+
+  /** Look up a live adapter by name, e.g. "telegram". Used by the daemon
+   *  reload path to hot-swap account configs without a restart. */
+  getChannel(name: string): ChannelAdapter | undefined {
+    return this.channels.get(name)
+  }
+
+  addChannel(adapter: ChannelAdapter): void {
+    this.channels.set(adapter.name, adapter)
+    adapter.onMessage((msg) => this.handleMessage(adapter, msg))
+  }
+
+  /**
+   * Send an outbound message to any registered channel.
+   * Used for agent-initiated messages, cron notifications, cross-channel routing.
+   *
+   * If accountId is not provided for Telegram, auto-resolves from agentId binding.
+   *
+   * `opts.idempotencyKey` — when set, the router caches the (channel,chatId,key)
+   *  tuple for `dedupeWindowMs` (default 60s) and returns the cached messageId
+   *  for repeat calls within the window. The default key is a sha256 of the
+   *  body so an agent that re-runs the same `channel.reply` tool call doesn't
+   *  produce duplicate comments — the canonical fix for the raw-curl-twice
+   *  scenario diagnosed on MR #236 (2026-05-08).
+   *
+   *  Why here and not in the adapter: the router is the single funnel for
+   *  agent + cron + API + cross-channel sends. Workflow `action.send` lives
+   *  at a different abstraction (explicit, scripted, retry semantics owned
+   *  by the engine) so it intentionally stays on the direct adapter path.
+   */
+  async sendOutbound(
+    msg: OutgoingMessage & { accountId?: string },
+    opts?: {
+      idempotencyKey?: string
+      dedupeWindowMs?: number
+      /** False when the text is already in the agent's session, e.g. the
+       *  reply to a turn the registry just ran (A2A callbacks, #277). */
+      recordInSession?: boolean
+    },
+  ): Promise<string | void> {
+    const adapter = this.channels.get(msg.channel)
+    if (!adapter) {
+      throw new Error(`Unknown channel: "${msg.channel}". Available: ${[...this.channels.keys()].join(", ")}`)
+    }
+
+    // Idempotency check — only when the caller opts in. Default-off keeps
+    // every legacy /send + cron path working unchanged.
+    const dedupeKey = opts?.idempotencyKey !== undefined
+      ? this.sendDedupeKey(msg.channel, msg.chatId, msg.text, opts.idempotencyKey)
+      : undefined
+    if (dedupeKey) {
+      const window = opts?.dedupeWindowMs ?? 60_000
+      const cached = this.sendDedupeGet(dedupeKey, window)
+      if (cached !== undefined) {
+        this.log(`Outbound [${msg.channel}] -> ${msg.chatId}: dedup hit (suppressed within ${window}ms window)`)
+        return cached ?? undefined
+      }
+    }
+
+    // Auto-resolve Telegram accountId from agentId if not provided
+    let accountId = msg.accountId
+    if (adapter.name === "telegram" && !accountId && msg.agentId) {
+      accountId = this.getAccountForAgent(msg.agentId)
+    }
+
+    // Relayed agent text (async mesh results, /send, cross-channel) can carry
+    // an `agentx:ui` block. Lift it like the reply path does; when rich
+    // messages are off, still strip it so raw markup never reaches the chat.
+    // Explicit rich fields from the caller win — the text is left alone.
+    if (
+      (msg.channel === "telegram" || msg.channel === "whatsapp") &&
+      msg.text?.includes("agentx:ui") && !msg.buttons && !msg.poll && !msg.media
+    ) {
+      const { cleanText, ui } = extractUiDirective(msg.text)
+      if (ui) {
+        if (ui.skippedActions?.length) {
+          this.log(`Outbound [${msg.channel}] -> ${msg.chatId}: agentx:ui dropped ${ui.skippedActions.length} action button(s) (callback support is Phase 2): ${ui.skippedActions.join(", ")}`)
+        }
+        const rich = msg.agentId === undefined || this.richMessagesAllowed(msg.agentId, msg.channel)
+        const extras = rich ? uiToOutgoing(ui) : {}
+        // Buttons need a text message to hang on; a lone poll/media needs none.
+        const text = cleanText || (extras.buttons ? "⌄" : "")
+        if (!text && !extras.poll && !extras.media) {
+          this.log(`Outbound [${msg.channel}] -> ${msg.chatId}: only an agentx:ui block and rich messages are off — nothing to send`)
+          return
+        }
+        msg = { ...msg, text, ...extras }
+      }
+    }
+
+    this.log(`Outbound [${msg.channel}] -> ${msg.chatId}: ${msg.text.slice(0, 80)}`)
+
+    let messageId: string | void
+    if (adapter.name === "telegram" && accountId) {
+      messageId = await this.adapterSend(adapter, { ...msg, accountId })
+    } else {
+      messageId = await adapter.send(msg)
+    }
+
+    // Record into dedupe table after the send so a future repeat within the
+    // window returns the same id even when the first send produced a void.
+    if (dedupeKey) {
+      this.sendDedupeStore(dedupeKey, typeof messageId === "string" ? messageId : null)
+    }
+
+    // Record outbound into the recipient agent's channel session so cron/api/
+    // a2a sends become visible to the next inbound turn on the same chatId.
+    // This closes the cron-vs-telegram split: when marketing-agent's daily
+    // cron sends "trend brief" to Alex at 06:17, the next telegram message
+    // from Alex at 08:36 sees the brief in session history instead of treating
+    // the conversation as fresh.
+    //
+    // Only fires when an agentId is set — manual /send tests without an agent
+    // identity stay out of session JSON to avoid polluting an agent's
+    // conversation with anonymous bot traffic.
+    if (msg.agentId && opts?.recordInSession !== false) {
+      try {
+        this.registry.getSessionStore().addAgentMessage(msg.agentId, msg.channel, msg.chatId, msg.text)
+      } catch (e: any) {
+        this.log(`Failed to record outbound in recipient session: ${e.message}`)
+      }
+    }
+
+    return messageId
+  }
+
+  /** List registered channel names. */
+  getChannelNames(): string[] {
+    return [...this.channels.keys()]
+  }
+
+  async startAll(): Promise<void> {
+    for (const [name, adapter] of this.channels) {
+      this.log(`Starting channel: ${name}`)
+      await adapter.start()
+    }
+    // Replay any work the previous process committed to but never finished.
+    // Deferred until after channel startup so adapters can actually send
+    // replies. Fire-and-forget — we don't block normal traffic on it.
+    this.replayInflight().catch((e) => this.log(`Inflight replay error: ${e.message}`))
+  }
+
+  /**
+   * On startup, re-run any incoming message that was recorded as `start` but
+   * never got a matching `done` in the inflight log. Those are tasks the
+   * previous process committed to handling but crashed before completing.
+   */
+  private async replayInflight(): Promise<void> {
+    const unfinished = this.inflight.loadUnfinished()
+    if (unfinished.length === 0) return
+    this.log(`Inflight replay: ${unfinished.length} task(s) to resume from previous run`)
+    for (const entry of unfinished) {
+      const adapter = this.channels.get(entry.channel)
+      if (!adapter) {
+        this.log(`Inflight replay: adapter "${entry.channel}" not available, skipping task ${entry.id}`)
+        // Mark it done so we don't re-attempt forever — channel may be
+        // permanently disabled in the current config.
+        this.inflight.done(entry.id)
+        continue
+      }
+      const msg: IncomingMessage = {
+        id: entry.id,
+        channel: entry.channel,
+        accountId: entry.accountId,
+        sender: entry.sender,
+        group: entry.group,
+        text: entry.text,
+        replyTo: entry.replyTo,
+        replyToText: entry.replyToText,
+        timestamp: new Date(entry.timestamp),
+        resolvedAgent: entry.resolvedAgent,
+        preferNode: entry.preferNode,
+      }
+      this.log(`Inflight replay: ${entry.channel}/${entry.id} (agent=${entry.resolvedAgent || "resolve"})`)
+      this.handleMessage(adapter, msg, { replay: true })
+        .catch((e) => this.log(`Inflight replay failed for ${entry.id}: ${e.message}`))
+        // Always mark done on replay — single-shot by design. If the replayed
+        // handler re-committed and wrote its own done, the duplicate is
+        // harmless (loadUnfinished dedups by id). If the handler returned
+        // early (agent removed from config, no adapter, etc.), this clears
+        // the stale entry so we don't retry forever.
+        .finally(() => this.inflight.done(entry.id))
+    }
+    // Compact the file now that we've snapshotted — old entries are either
+    // being replayed (will get a fresh start/done) or already drained.
+    this.inflight.compact()
+  }
+
+  /** Re-enter chat messages a restart cut off (agents/resume). The message
+   *  goes through the normal path, so its answer lands in the same chat. */
+  createResumer(): Resumer {
+    return {
+      resume: async ({ origin, note, attempt, run }) => {
+        if (origin.kind !== "router") throw new Error("not a router run")
+        const adapter = this.channels.get(origin.adapter)
+        if (!adapter) throw new Error(`channel "${origin.adapter}" is not running`)
+        const msg = incomingFrom(origin.message)
+        msg.resume = { note, attempt, resumedFrom: run.taskId }
+        // Handed over, not awaited: the run may take minutes, and one slow
+        // run mustn't hold up the rest of the resume queue.
+        this.handleMessage(adapter, msg, { replay: true })
+          .catch((e) => this.log(`Resume of ${run.taskId} failed: ${e.message}`))
+      },
+      tell: async (origin, text) => {
+        if (origin.kind !== "router") return
+        const adapter = this.channels.get(origin.adapter)
+        if (!adapter) throw new Error(`channel "${origin.adapter}" is not running`)
+        const msg = incomingFrom(origin.message)
+        await this.adapterSend(adapter, {
+          channel: msg.channel,
+          chatId: msg.group?.id || msg.sender.id,
+          text,
+          // Only Telegram threads a reply by message id; elsewhere replyTo
+          // means something else (a discussion, a note), so leave it out.
+          replyTo: msg.channel === "telegram" ? msg.id : undefined,
+          accountId: msg.accountId,
+          agentId: msg.resolvedAgent,
+          parseMode: "plain",
+        })
+      },
+    }
+  }
+
+  async stopAll(): Promise<void> {
+    for (const [name, adapter] of this.channels) {
+      this.log(`Stopping channel: ${name}`)
+      await adapter.stop()
+    }
+  }
+
+  /**
+   * Returns true if this message id was processed within MESSAGE_ID_TTL_MS.
+   * Stamps the key when false. Size-bounded GC avoids unbounded growth.
+   */
+  private isDuplicateMessage(msg: IncomingMessage): boolean {
+    const key = this.messageKey(msg)
+    if (!key) return false
+    const now = Date.now()
+    if (this.recentMessageIds.size >= this.MESSAGE_ID_MAX_ENTRIES) {
+      for (const [k, t] of this.recentMessageIds) {
+        if (now - t > this.MESSAGE_ID_TTL_MS) this.recentMessageIds.delete(k)
+      }
+    }
+    const seen = this.recentMessageIds.get(key)
+    if (seen && now - seen < this.MESSAGE_ID_TTL_MS) return true
+    this.recentMessageIds.set(key, now)
+    this.scheduleDedupSave()
+    return false
+  }
+
+  private messageKey(msg: Pick<IncomingMessage, "channel" | "accountId" | "id">): string | undefined {
+    if (!msg.id) return undefined
+    return `${msg.channel}:${msg.accountId || "default"}:${msg.id}`
+  }
+
+  /**
+   * Phase 1 commit 6.b — record one router decision in the intent ledger
+   * when the source is enabled (mode != "off"). Covers all router
+   * channels (telegram, slack, whatsapp, discord). Each channel has its
+   * own per-source mode flag so they can be promoted independently in 1c.
+   * Wrapped in try/catch so a ledger failure can never break message
+   * routing — legacy is still authoritative until the 1c per-source
+   * promotion.
+   *
+   * Returns the recorded decision when ledger fired (and outcome was
+   * "dispatched"), so the caller can tag the IncomingMessage with
+   * `intentRef` for resolution-on-completion. Returns undefined when
+   * the source is off, the channel isn't supported, ledger threw, or
+   * the ledger's own decision was non-dispatched (deduped/halted —
+   * no resolution to write).
+   */
+  private recordRouterDecisionInLedger(
+    msg: IncomingMessage,
+    legacy: LegacyOutcome,
+  ): { eventId: string; decidedBy: string } | undefined {
+    const source = routerChannelToSource(msg.channel)
+    if (!source) return undefined // channel not router-supported (e.g., gitlab routes itself)
+    if (getLedgerMode(source) === "off") return undefined
+    try {
+      const decision = recordRouterDispatch(getDefaultLedger(), msg, source, JSON.stringify(msg), legacy)
+      if (decision.outcome === "dispatched") {
+        return { eventId: decision.eventId, decidedBy: decision.decidedBy }
+      }
+      return undefined
+    } catch (e: any) {
+      this.log(`[ledger] router ${msg.channel}/${msg.id} record failed: ${e?.message ?? e}`)
+      return undefined
+    }
+  }
+
+  /** Each inbound message is an entry point: every event it causes
+   *  (routing, agent task, workflow run, mesh forward) shares one root id. */
+  private handleMessage(
+    adapter: ChannelAdapter,
+    msg: IncomingMessage,
+    opts: { replay?: boolean } = {},
+  ): Promise<void> {
+    return withNewRoot(() => this.routeMessage(adapter, msg, opts))
+  }
+
+  private async routeMessage(
+    adapter: ChannelAdapter,
+    msg: IncomingMessage,
+    opts: { replay?: boolean },
+  ): Promise<void> {
+    // Dedup: drop redeliveries of the same incoming message id within a TTL.
+    // Guards against GitLab webhook retries, Baileys double-emit, and Telegram
+    // offset hiccups. Scoped per-accountId so multi-bot Telegram groups still
+    // route each account's legitimate view of the message.
+    //
+    // Replay-on-resume (from inflight log) deliberately bypasses dedup — a
+    // replayed message is one the previous process committed to handling but
+    // crashed before finishing, so the dedup entry is stale and the user
+    // still hasn't received their answer.
+    if (!opts.replay && this.isDuplicateMessage(msg)) {
+      this.log(`Duplicate ${msg.channel} message dropped: ${msg.accountId || "default"}/${msg.id}`)
+      this.recordRouterDecisionInLedger(msg, {
+        agentId: null, outcome: "deduped", reason: "isDuplicateMessage",
+      })
+      return
+    }
+
+    // Pre-hook
+    if (this.hooks?.has("pre:channel-message" as any)) {
+      const hookResult = await this.hooks.execute("pre:channel-message" as any, {
+        event: "pre:channel-message" as any,
+        channel: msg.channel,
+        sender: msg.sender.name,
+        text: msg.text,
+        group: msg.group?.name,
+        // Full IncomingMessage for subscribers that need structured access
+        // (e.g. the workflow dispatcher). Existing subscribers read the
+        // flat fields above and are unaffected by this addition.
+        msg,
+      })
+
+      if (hookResult.blocked) {
+        this.log(`Message blocked by hook: ${hookResult.message}`)
+        this.recordRouterDecisionInLedger(msg, {
+          agentId: null, outcome: "halted",
+          reason: `pre-hook blocked: ${hookResult.message ?? ""}`.trim(),
+        })
+        return
+      }
+
+      if (hookResult.modified?.text) {
+        msg = { ...msg, text: hookResult.modified.text as string }
+      }
+    }
+
+    // Log ALL group messages for conversation context (before agent resolution)
+    if (msg.group) {
+      const chatId = msg.group.id
+      this.groupLog.add(chatId, msg.sender.name, msg.text)
+    }
+
+    // Check if message matches a defined service (before agent routing)
+    if (this.serviceMatcher) {
+      const chatId = msg.group?.id || msg.sender.id
+      const matched = this.serviceMatcher.match(msg.text, msg.sender.id, msg.channel)
+      if (matched) {
+        this.log(`Service matched: "${matched.service.name}" for ${msg.sender.name} (trigger: ${matched.trigger})`)
+        // Phase 1 commit 6.b-extended: service-matcher claims the message
+        // before agent routing. From the agent-router's POV no agent was
+        // dispatched — a service handler ran instead. Recorded as halted
+        // with the service name in the reason for forensics.
+        this.recordRouterDecisionInLedger(msg, {
+          agentId: null, outcome: "halted",
+          reason: `service-match: ${matched.service.name} (trigger: ${matched.trigger})`,
+        })
+        const replyAccountId = msg.accountId
+        this.adapterReact(adapter, chatId, msg.id, "👀", replyAccountId)
+        const typingTimer = this.startTypingLoop(adapter, chatId, replyAccountId)
+
+        await this.serviceMatcher.execute(
+          matched.service,
+          this.registry,
+          { channel: msg.channel, sender: msg.sender.name, chatId },
+          async (text) => {
+            clearInterval(typingTimer)
+            await this.adapterSend(adapter, {
+              channel: msg.channel, chatId, text, replyTo: msg.id, accountId: replyAccountId,
+            })
+          },
+        )
+        return
+      }
+    }
+
+    // Resolve agent via the routing pipeline (Phase 2). Each stage produces
+    // a named decision; we trace the deciding stage so "why didn't agent X
+    // get this message?" is one log-line away.
+    const result = this.runRoutingPipeline(msg)
+    const agentId = result.agentId
+
+    if (!agentId) {
+      this.traceRoute(msg, "drop", result.reason, result.decidingStage)
+      this.recordRouterDecisionInLedger(msg, {
+        agentId: null, outcome: "halted", reason: `routing:${result.reason}`,
+      })
+      return
+    }
+
+    // Dedup: in groups, multiple bot accounts receive the same message.
+    // Only the account BOUND to this agent should handle it. When multiple
+    // accounts share the same agentBinding, getAccountForAgent prefers one
+    // that's in the group — without this, dropping by the absent canonical
+    // bot would silently swallow messages received via the in-group bot.
+    if (msg.group && msg.channel === "telegram") {
+      const boundAccount = this.getAccountForAgent(agentId, msg.group.id)
+      if (boundAccount && boundAccount !== msg.accountId) {
+        this.traceRoute(msg, "drop", `multi-account-dedup (bound=${boundAccount} got=${msg.accountId})`, "multi-account-dedup")
+        this.recordRouterDecisionInLedger(msg, {
+          agentId: null, outcome: "halted",
+          reason: `multi-account-dedup (bound=${boundAccount} got=${msg.accountId})`,
+        })
+        return
+      }
+    }
+
+    this.traceRoute(msg, "match", `${result.decidingStage} agent=${agentId}`, result.decidingStage, agentId)
+    const intentRef = this.recordRouterDecisionInLedger(msg, {
+      agentId, outcome: "dispatched", reason: result.decidingStage,
+    })
+    // Phase 1 / 6 — tag the IncomingMessage so registry.execute records
+    // a ledger resolution when the agent task completes. Only set when
+    // the ledger's own decision was "dispatched" (recordRouterDecision...
+    // already filtered the deduped/halted cases).
+    if (intentRef) {
+      msg = { ...msg, intentRef }
+    }
+
+    const chatId = msg.group?.id || msg.sender.id
+
+    const activeKey = this.messageKey(msg)
+    if (activeKey && this.activeMessageKeys.has(activeKey)) {
+      this.log(`Duplicate in-flight ${msg.channel} message dropped: ${msg.accountId || "default"}/${msg.id}`)
+      this.recordRouterDecisionInLedger(msg, {
+        agentId: null, outcome: "deduped", reason: "in-flight duplicate",
+      })
+      return
+    }
+    if (activeKey) this.activeMessageKeys.add(activeKey)
+
+    // From here on we're committed to processing this message. Write a `start`
+    // entry to the inflight log so a crash between now and the task's
+    // completion gets the replay treatment on next boot. `done` is always
+    // written via the try/finally wrapper further down.
+    this.inflight.start({
+      id: msg.id,
+      channel: msg.channel,
+      accountId: msg.accountId,
+      text: msg.text,
+      sender: msg.sender,
+      group: msg.group,
+      replyTo: msg.replyTo,
+      replyToText: msg.replyToText,
+      timestamp: (msg.timestamp instanceof Date ? msg.timestamp : new Date()).toISOString(),
+      resolvedAgent: agentId,
+      preferNode: msg.preferNode,
+    })
+
+    try { return await this.processResolvedMessage(adapter, msg, agentId, chatId) }
+    finally {
+      if (activeKey) this.activeMessageKeys.delete(activeKey)
+      this.inflight.done(msg.id)
+    }
+  }
+
+  /** The actual processing body — split out so handleMessage can wrap it in
+   *  the inflight try/finally without drowning the happy path in indentation. */
+  private async processResolvedMessage(
+    adapter: ChannelAdapter,
+    msg: IncomingMessage,
+    agentId: string,
+    chatId: string,
+  ): Promise<void> {
+    // If preferNode is set, skip local and route directly to the specified mesh peer
+    if (msg.preferNode) {
+      this.log(`preferNode="${msg.preferNode}" — forcing mesh routing for agent "${agentId}"`)
+      const routed = await this.handleViaMeshByPeer(adapter, msg, agentId, msg.preferNode)
+      if (!routed) {
+        this.log(`Mesh peer "${msg.preferNode}" not found or unhealthy for agent "${agentId}"`)
+        this.deferForPeer(adapter, msg, agentId, msg.preferNode)
+      }
+      return
+    }
+
+    const agentDef = this.registry.getAgent(agentId)
+
+    // Agent not found locally — try forwarding to a mesh peer
+    if (!agentDef) {
+      const routed = await this.handleViaMeshByAgentId(adapter, msg, agentId)
+      if (!routed) {
+        // Not reachable right now. If some peer we have seen up advertises
+        // this agent, its node is down rather than the agent unknown — hold
+        // the message for replay instead of discarding it.
+        const known = this.mesh?.findAgentPeer(agentId)
+        if (known && !known.healthy) {
+          this.deferForPeer(adapter, msg, agentId, known.peer)
+        } else {
+          this.log(`Agent "${agentId}" not found locally or on any mesh peer`)
+        }
+      }
+      return
+    }
+
+    const agentName = agentDef.name || agentId
+
+    // Determine which bot account should send the response. In groups, prefer
+    // the account whose bot is actually present (matters for multi-bound agents).
+    const replyAccountId = this.getAccountForAgent(agentId, msg.group?.id) || msg.accountId
+
+    this.log(
+      `Routing [${msg.channel}/${msg.sender.name}] -> "${agentName}": ${msg.text.slice(0, 80)}`,
+    )
+
+    // React with 👀 to acknowledge
+    this.adapterReact(adapter, chatId, msg.id, "👀", replyAccountId)
+
+    // Start typing indicator loop (from the correct bot)
+    const typingTimer = this.startTypingLoop(adapter, chatId, replyAccountId)
+
+    // Streaming setup with smart block streaming.
+    //
+    // Single mode for every channel: first block creates a real message,
+    // subsequent blocks `editMessageText` it in place. Stream is gated by
+    // adapter.editMessage support so adapters that can't edit just receive
+    // a single final message.
+    //
+    // Earlier versions used `sendMessageDraft` for Telegram DMs as a "smoother
+    // animation" path — but Telegram drafts are bot-side typing affordances
+    // that auto-clear when the bot stops updating them, never becoming
+    // persistent messages (sendMessageDraft returns `result: true`, not a
+    // message id). The final reply written via sendDraft therefore vanished
+    // shortly after delivery. Edit-in-place sits well under Telegram's edit
+    // rate limit at the existing 1.5s throttle and gives a uniform path
+    // across DMs, groups, and non-Telegram channels.
+    // Rolling multi-message streaming preview. As the reply accumulates, the
+    // live message is edited in place; once it grows past one Telegram chunk
+    // it rolls into additional messages instead of freezing/truncating (the
+    // old single-`sentMessageId` path clipped everything past ~3900 chars).
+    const canStream = typeof adapter.editMessage === "function"
+    let fullStreamText = ""
+    let anchorSends = 0
+    const streaming = canStream
+      ? new StreamingMessage({
+          maxChars: msg.channel === "telegram" ? TG_CHUNK_CHARS : 3900,
+          send: async (text: string) => {
+            const replyTo = anchorSends === 0 ? msg.id : undefined
+            anchorSends++
+            try {
+              return await this.adapterSend(adapter, {
+                channel: msg.channel, chatId, text, replyTo, accountId: replyAccountId,
+              })
+            } catch (e: any) {
+              this.log(`Stream preview send failed for ${msg.channel}:${chatId}: ${e?.message || e}`)
+              return ""
+            }
+          },
+          edit: async (messageId: string, text: string) => {
+            try {
+              return await this.adapterEdit(adapter, chatId, messageId, text, undefined, replyAccountId)
+            } catch (e: any) {
+              this.log(`Stream preview edit failed for ${msg.channel}:${chatId} message ${messageId}: ${e?.message || e}`)
+              return false
+            }
+          },
+        })
+      : undefined
+
+    const blockStream = streaming
+      ? new BlockStream(
+          async (block: string) => {
+            fullStreamText += block
+            await streaming.update(previewText(fullStreamText))
+          },
+          undefined,
+          msg.channel,
+        )
+      : undefined
+
+    const onDelta = blockStream
+      ? (_delta: string, _fullText: string) => {
+          blockStream.push(_delta)
+        }
+      : undefined
+
+    // Enrich channelMeta agents with handles from config
+    if (msg.channelMeta?.agents) {
+      for (const agent of msg.channelMeta.agents) {
+        if (!agent.handle) {
+          const def = this.registry.getAgent(agent.id)
+          if (def) {
+            agent.handle = def.mentions.find((m: string) => m.startsWith("@"))
+            agent.name = def.name
+          }
+        }
+      }
+    }
+
+    // Build group conversation context (recent messages from the group)
+    const groupContext = msg.group ? this.groupLog.buildContext(chatId) : ""
+    const messageWithContext = groupContext
+      ? `${groupContext}\n\n${msg.sender.name}: ${msg.text}`
+      : msg.text
+
+    // Telegram deliverables: snapshot the agent's outbox so files the agent
+    // drops there during THIS task can be sent into the chat afterwards.
+    const outboxDir = msg.channel === "telegram" ? outboxDirFor((agentDef as { workspace?: string }).workspace) : null
+    const outboxBefore = outboxDir ? snapshotOutbox(outboxDir) : null
+
+    // Execute agent task
+    const response = await this.registry.execute(
+      {
+        message: msg.resume ? `${msg.resume.note}\n${messageWithContext}` : messageWithContext,
+        agentId,
+        // Resume after restart (#103): record how to re-enter this run, and
+        // hand it from the inflight log to the run journal once it starts,
+        // so a restart can't resume it twice.
+        origin: { kind: "router", adapter: msg.channel, message: serializeIncoming(msg) },
+        resumeAttempt: msg.resume?.attempt,
+        resumedFrom: msg.resume?.resumedFrom,
+        onStart: () => this.inflight.done(msg.id),
+        // Phase 1 / 6 — propagate the intent-ledger reference so the
+        // registry can record a resolution on completion. Set by
+        // gitlab/router shadow-mode wiring; absent under mode=off.
+        intentRef: msg.intentRef,
+        context: {
+          channel: msg.channel,
+          sender: msg.sender.name,
+          senderId: msg.sender.id,
+          senderUsername: msg.sender.username,
+          group: msg.group?.name,
+          chatId,  // stable ID for session keying (issue path for GitLab, group ID for Telegram)
+          mediaPath: msg.media?.path,
+          mediaType: msg.media?.type,
+          replyToText: msg.replyToText,
+          channelMeta: msg.channelMeta,
+          runbookPath: msg.runbookPath,
+          runbookFiles: msg.runbookFiles,
+        },
+      },
+      onDelta,
+    )
+
+    clearInterval(typingTimer)
+
+    // Flush any remaining streamed content. Awaited so that sentMessageId is
+    // guaranteed set (if a stream block arrived) before we decide whether the
+    // final write goes via adapterSend (new message) or adapterEdit (update).
+    // Skipping the await caused double-sends on fast streams: the flushed
+    // first emission queued an adapterSend, the router moved on with
+    // sentMessageId still undefined, then the router's own adapterSend fired
+    // — producing two separate messages instead of one edited.
+    await blockStream?.flush()
+
+    if (response.error) {
+      // Queued messages are not errors — the message will be processed later
+      if (parseQueued(response.error)) {
+        clearInterval(typingTimer)
+        this.log(`Message queued for ${agentName}`)
+        return
+      }
+
+      // Operator-cancelled task — the operator already pressed the button,
+      // they don't need an "Error: task cancelled by operator" echo in the
+      // chat. Skipping the post also keeps the conversation clean for the
+      // next follow-up turn (no orphan assistant message between the
+      // cancelled user turn and the operator's correction).
+      if (response.errorKind === "cancelled") {
+        this.log(`Task cancelled for ${agentName} — suppressing channel error echo`)
+        return
+      }
+      // Stopped by a daemon restart: the next boot resumes it or reports
+      // it, so an "Error:" here would only be a false failure.
+      if (response.errorKind === "interrupted") {
+        this.log(`Task interrupted for ${agentName} (${response.error}) — resume handles the reply after restart`)
+        return
+      }
+
+      this.log(`Agent error: ${response.error}`)
+      const errorText = `Error: ${response.error}`
+      if (streaming?.primaryId) {
+        const edited = await this.adapterEdit(adapter, chatId, streaming.primaryId, errorText, "plain", replyAccountId)
+        if (!edited) {
+          this.log(`Error response edit returned false for ${msg.channel}:${chatId} message ${streaming.primaryId}; sending fallback`)
+          await this.adapterSend(adapter, {
+            channel: msg.channel,
+            chatId,
+            text: errorText,
+            replyTo: msg.id,
+            parseMode: "plain",
+            accountId: replyAccountId,
+            agentId,
+          })
+        }
+      } else {
+        await this.adapterSend(adapter, {
+          channel: msg.channel,
+          chatId,
+          text: errorText,
+          replyTo: msg.id,
+          parseMode: "plain",
+          accountId: replyAccountId,
+          agentId,
+        })
+      }
+      return
+    }
+
+    // Post-hook
+    let responseText = response.content
+    if (this.hooks?.has("post:channel-message" as any)) {
+      const hookResult = await this.hooks.execute("post:channel-message" as any, {
+        event: "post:channel-message" as any,
+        channel: msg.channel,
+        sender: msg.sender.name,
+        response: responseText,
+        agentId,
+      })
+
+      if (hookResult.blocked) {
+        this.log(`Response blocked by hook: ${hookResult.message}`)
+        return
+      }
+
+      if (hookResult.modified?.response) {
+        responseText = hookResult.modified.response as string
+      }
+    }
+
+    // Prefix response with agent identity on shared-identity channels.
+    // GitLab: when no per-agent token (all share one user)
+    // WhatsApp: always (single phone number, all agents share it)
+    if (msg.channel === "gitlab" && responseText) {
+      const gitlabAdapter = this.channels.get("gitlab") as any
+      const hasOwnToken = gitlabAdapter?.getAgentToken?.(agentId)
+      if (!hasOwnToken) {
+        responseText = `> **${agentName}** (${agentId})\n\n${responseText}`
+      }
+    }
+    if (msg.channel === "whatsapp" && responseText) {
+      responseText = `*${agentName}*\n\n${responseText}`
+    }
+
+    // Auto-reply gate — channels.<name>.autoReplyLegacy controls whether
+    // the agent's `response.content` gets posted automatically as a comment.
+    // When false, the agent must have explicitly called `channel.reply`
+    // during the task; response.content is then treated as conversational
+    // narrative for trace logs, NOT something to relay back to the channel.
+    // This is the canonical fix for the "agent posts its own self-narrative
+    // as a comment" bug — turning the flag off makes the agent's reasoning
+    // text invisible to the channel by design.
+    const channelCfg = (this.config.channels as Record<string, { autoReplyLegacy?: boolean } | undefined>)?.[msg.channel]
+    // Per-agent `gitlabAutoReply` overrides the channel default when set, so a
+    // coder that ends its turn with a summary auto-posts even while the fleet
+    // default stays false. Falls back to channel.autoReplyLegacy (default true).
+    const perAgentAutoReply = (agentDef as { gitlabAutoReply?: boolean } | undefined)?.gitlabAutoReply
+    const autoReplyLegacy = perAgentAutoReply ?? (channelCfg?.autoReplyLegacy !== false)
+    if (!autoReplyLegacy && responseText && (msg.channel === "gitlab" || msg.channel === "github")) {
+      this.log(`Auto-reply suppressed for ${msg.channel}:${chatId} — autoReply=false (agent must call channel.reply)`)
+      // Still log into the group conversation log below, just don't post.
+      responseText = ""
+    }
+
+    // Lift any in-band `agentx:ui` directive out of the reply: strip it from
+    // the visible text and render it as buttons/poll/media on the final
+    // message. Gated per-agent (richMessages) and per-channel below.
+    let ui: UiDirective | undefined
+    if (responseText && this.richMessagesAllowed(agentId, msg.channel)) {
+      const extracted = extractUiDirective(responseText)
+      responseText = extracted.cleanText
+      ui = extracted.ui
+      if (ui?.skippedActions?.length) {
+        this.log(`[${agentId}] agentx:ui dropped ${ui.skippedActions.length} action button(s) (callback support is Phase 2): ${ui.skippedActions.join(", ")}`)
+      }
+    }
+
+    // Final message:
+    //   1. Stream landed → reconcile the rolling preview to the canonical
+    //      post-hook text (rolls into more messages if it grew).
+    //   2. No stream → plain send; telegram.send() chunk-spills long text.
+    let sentResponseId: string | undefined
+    if (responseText) {
+      if (streaming?.started) {
+        await streaming.update(responseText)
+        sentResponseId = streaming.primaryId
+        if (ui) await this.attachUiExtras(adapter, msg.channel, chatId, streaming.lastId, ui, replyAccountId, agentId)
+      } else {
+        sentResponseId = await this.adapterSend(adapter, {
+          channel: msg.channel,
+          chatId,
+          text: responseText,
+          replyTo: msg.id,
+          accountId: replyAccountId,
+          agentId,
+          ...(ui ? uiToOutgoing(ui) : {}),
+        })
+      }
+    } else if (ui && streaming?.started) {
+      // Text was suppressed (autoReplyLegacy) but a directive still stands.
+      await this.attachUiExtras(adapter, msg.channel, chatId, streaming.lastId, ui, replyAccountId, agentId)
+    }
+
+    // Deliver any files the agent put in its outbox during this task
+    // (posters, documents) into the Telegram chat, then drain them.
+    if (outboxDir && outboxBefore && !response.error) {
+      await this.deliverOutboxFiles(adapter, outboxDir, outboxBefore, {
+        channel: msg.channel,
+        chatId,
+        accountId: replyAccountId,
+        agentId,
+        replyTo: sentResponseId || msg.id,
+      }).catch((e) => this.log(`Outbox delivery failed for ${agentId}: ${e.message}`))
+    }
+
+    // Log bot response in group conversation
+    if (msg.group && responseText) {
+      this.groupLog.add(chatId, agentName, responseText)
+    }
+
+    // Notify on long-running task completion (cross-channel)
+    const notifyConfig = this.config.notifications
+    if (notifyConfig?.destination && response.duration) {
+      const thresholdMs = (notifyConfig.longTaskThreshold || 30) * 1000
+      const shouldNotify =
+        (response.duration >= thresholdMs && !response.error && notifyConfig.on?.taskComplete) ||
+        (response.error && notifyConfig.on?.taskError)
+
+      if (shouldNotify) {
+        const durSec = Math.round(response.duration / 1000)
+        const status = response.error ? "failed" : "completed"
+        // Preserve line boundaries so pipeline/MR bodies aren't chopped
+        // mid-word (e.g., "Duration: 328s\nPipeline #369" shouldn't become
+        // "Duration: 328s\nP"). Keep the first few lines + more chars.
+        const trigger = firstLines(msg.text, 6, 300)
+        const preview = response.error
+          ? ellipsize(response.error, 300)
+          : firstLines(response.content, 6, 400)
+        const notifyText = `${status === "failed" ? "🔴" : "✅"} **${agentName}** ${status} (${durSec}s)\n${msg.channel}/${msg.sender.name}: ${trigger}\n${preview}`
+
+        this.sendOutbound({
+          channel: notifyConfig.destination.channel,
+          chatId: notifyConfig.destination.chatId,
+          text: notifyText,
+          agentId,
+          accountId: notifyConfig.destination.accountId,
+        }).catch((e) => {
+          this.log(`Task notification failed: ${e.message}`)
+        })
+      }
+    }
+
+    // Business layer: record task completion for KPI utilization tracking.
+    if (this.business && response.duration) {
+      this.business.recordTaskCompletion(
+        agentId,
+        Math.round(response.duration / 1000),
+        !response.error,
+        msg.channel,
+      )
+    }
+
+    // GitLab: auto-log time spent on the issue/MR
+    if (msg.channel === "gitlab" && response.duration && !response.error) {
+      const gitlabAdapter = this.channels.get("gitlab") as any
+      if (gitlabAdapter) {
+        gitlabAdapter.logTimeSpent(chatId, response.duration, agentId).catch((e: any) => {
+          this.log(`GitLab time tracking failed: ${e.message}`)
+        })
+      }
+    }
+
+    // Bot-to-bot delegation: if response mentions another agent, route to them.
+    // Works on Telegram, WhatsApp, and Discord. Not GitLab (uses its own @mention webhook flow).
+    const delegationChannels = ["telegram", "whatsapp", "discord", "slack"]
+    if (responseText && sentResponseId && delegationChannels.includes(msg.channel)) {
+      this.handleBotToBotChain(adapter, msg, agentId, responseText, sentResponseId, 0).catch((e) => {
+        this.log(`Bot-to-bot error: ${e.message}`)
+      })
+    }
+  }
+
+  private static readonly MAX_BOT_CHAIN_DEPTH = 7
+
+  /**
+   * Bot-to-bot conversation relay.
+   *
+   * The @-mentions in the opening reply (usually the lead agent's delegation)
+   * form a work queue: every mentioned agent gets a turn, in config order,
+   * even if an intermediate reply forgets to hand off or reports back to the
+   * lead instead of forwarding. @-mentions appearing in later replies are
+   * appended to the queue. Guards:
+   * 1. Max dispatches per user message (MAX_BOT_CHAIN_DEPTH).
+   * 2. No agent runs twice in the same relay (prevents A→B→A loops and
+   *    report-back ping-pong).
+   * Works on Telegram (multi-account), WhatsApp (shared number), Discord.
+   */
+  private async handleBotToBotChain(
+    adapter: ChannelAdapter,
+    originalMsg: IncomingMessage,
+    sourceAgentId: string,
+    responseText: string,
+    responseMessageId: string,
+    depth: number,
+    visited: Set<string> = new Set(),
+  ): Promise<void> {
+    const chatId = originalMsg.group?.id || originalMsg.sender.id
+    visited.add(sourceAgentId)
+
+    // Agent ids whose @-handle appears in `text`, in config order,
+    // excluding the opener and anyone who already had a turn.
+    const mentionedAgents = (text: string): string[] => {
+      const out: string[] = []
+      const lower = text.toLowerCase()
+      for (const [id, def] of Object.entries(this.config.agents)) {
+        if (id === sourceAgentId || visited.has(id)) continue
+        const atMentions = def.mentions.filter((m: string) => m.startsWith("@"))
+        if (atMentions.some((m: string) => lower.includes(m.toLowerCase()))) out.push(id)
+      }
+      return out
+    }
+
+    // Seed the queue from the opening reply: @-mentions plus personal-name
+    // mentions. A lead's delegation typically @s only the coordinator but
+    // names everyone involved ("kumpulkan progres dari Nadia, Dimas, Galih,
+    // dan Kirana") — those named teammates are part of the round too. Name
+    // seeding applies ONLY to this opening reply; later replies grow the
+    // queue via @-mentions only (see below), so narrative name-drops in
+    // progress reports don't summon people.
+    const queue: string[] = mentionedAgents(responseText)
+    {
+      const lower = responseText.toLowerCase()
+      for (const [id, def] of Object.entries(this.config.agents)) {
+        if (id === sourceAgentId || visited.has(id) || queue.includes(id)) continue
+        const firstName = (def.name || "").split(" ")[0].toLowerCase()
+        if (firstName.length >= 3 && new RegExp(`\\b${firstName}\\b`).test(lower)) queue.push(id)
+      }
+    }
+    let currentSource = sourceAgentId
+    let currentText = responseText
+    let currentMessageId = responseMessageId
+    let dispatches = 0
+
+    while (queue.length > 0) {
+      if (dispatches >= MessageRouter.MAX_BOT_CHAIN_DEPTH) {
+        this.log(`Bot-to-bot: max depth (${MessageRouter.MAX_BOT_CHAIN_DEPTH}) reached, stopping`)
+        return
+      }
+      const id = queue.shift()!
+      if (visited.has(id)) continue
+      const def = this.config.agents[id]
+      if (!def) continue
+      visited.add(id)
+      dispatches++
+
+      this.log(`Bot-to-bot [${dispatches}]: "${currentSource}" -> "${id}"`)
+
+      const targetAccountId = this.getAccountForAgent(id)
+
+      try {
+        // Target bot reacts 👀 to the source bot's message
+        this.adapterReact(adapter, chatId, currentMessageId, "👀", targetAccountId)
+
+        // Target bot shows typing
+        const typingTimer = this.startTypingLoop(adapter, chatId, targetAccountId)
+
+        // The first relayed agent gets the original user message as context
+        // so it knows the full picture; later agents get the previous reply.
+        const contextMessage = dispatches === 1
+          ? `[Original from ${originalMsg.sender.name}]: ${originalMsg.text}\n\n[${sourceAgentId} said]: ${responseText}`
+          : currentText
+
+        // Telegram deliverables: snapshot the target agent's outbox so files
+        // it drops there during this chained task get sent into the chat too
+        // (the main handler's drain only covers direct user mentions).
+        const chainOutboxDir = originalMsg.channel === "telegram" ? outboxDirFor((def as { workspace?: string }).workspace) : null
+        const chainOutboxBefore = chainOutboxDir ? snapshotOutbox(chainOutboxDir) : null
+
+        const response = await this.registry.execute({
+          message: contextMessage,
+          agentId: id,
+          context: {
+            channel: originalMsg.channel,
+            sender: `agent:${currentSource}`,
+            group: originalMsg.group?.name,
+            // The relay must keep the SAME chatId as the original message so
+            // every reply lands in the same session as the conversation it
+            // continues (keying by group NAME leaks turns into a separate
+            // name-based bucket).
+            chatId: originalMsg.group?.id || originalMsg.sender.id,
+            channelMeta: originalMsg.channelMeta,
+          },
+        })
+
+        clearInterval(typingTimer)
+
+        if (response.content && !response.error) {
+          // Prefix with agent identity on shared-number channels
+          let replyText = response.content
+          if (originalMsg.channel === "whatsapp") {
+            replyText = `*${def.name}*\n\n${replyText}`
+          }
+
+          const sentId = await this.adapterSend(adapter, {
+            channel: originalMsg.channel,
+            chatId,
+            text: replyText,
+            accountId: targetAccountId,
+            agentId: id,
+          })
+
+          // Record the chained reply in the group log so the whole team
+          // (and later context building) can see what was said.
+          if (originalMsg.group) {
+            this.groupLog.add(chatId, def.name || id, replyText)
+          }
+
+          // Deliver files the chained agent left in its outbox (posters,
+          // built pages) before the relay moves on.
+          if (chainOutboxDir && chainOutboxBefore) {
+            await this.deliverOutboxFiles(adapter, chainOutboxDir, chainOutboxBefore, {
+              channel: originalMsg.channel,
+              chatId,
+              accountId: targetAccountId,
+              agentId: id,
+              replyTo: sentId as string,
+            }).catch((e) => this.log(`Outbox delivery (chain) failed for ${id}: ${e.message}`))
+          }
+
+          // Grow the queue with any new @-mentions in this reply.
+          for (const next of mentionedAgents(response.content)) {
+            if (!queue.includes(next)) queue.push(next)
+          }
+
+          currentSource = id
+          currentText = response.content
+          if (sentId) currentMessageId = sentId as string
+        } else if (response.error) {
+          this.log(`Bot-to-bot "${id}" error: ${response.error}`)
+        }
+      } catch (e: any) {
+        this.log(`Bot-to-bot "${id}" failed: ${e.message}`)
+      }
+    }
+  }
+
+
+  // --- Outbound idempotency helpers ---
+
+  private sendDedupeKey(channel: string, chatId: string, body: string, idempotencyKey: string): string {
+    if (idempotencyKey) return `${channel}|${chatId}|key:${idempotencyKey}`
+    // Empty-string idempotencyKey means "use body hash".
+    const hash = createHash("sha256").update(body).digest("hex").slice(0, 16)
+    return `${channel}|${chatId}|h:${hash}`
+  }
+
+  private sendDedupeGet(key: string, windowMs: number): string | null | undefined {
+    const entry = this.sendDedupeMap.get(key)
+    if (!entry) return undefined
+    if (Date.now() - entry.postedAt > windowMs) {
+      this.sendDedupeMap.delete(key)
+      return undefined
+    }
+    return entry.messageId
+  }
+
+  private sendDedupeStore(key: string, messageId: string | null): void {
+    if (this.sendDedupeMap.size >= this.SEND_DEDUPE_MAX) {
+      // Coarse eviction — drop the oldest 10% of entries.
+      const target = Math.floor(this.SEND_DEDUPE_MAX * 0.9)
+      const sorted = Array.from(this.sendDedupeMap.entries()).sort(
+        (a, b) => a[1].postedAt - b[1].postedAt,
+      )
+      for (let i = 0; i < sorted.length - target; i++) {
+        this.sendDedupeMap.delete(sorted[i][0])
+      }
+    }
+    this.sendDedupeMap.set(key, { postedAt: Date.now(), messageId })
+  }
+
+  // --- Adapter helpers that pass accountId for Telegram ---
+
+  private async adapterSend(
+    adapter: ChannelAdapter,
+    msg: Omit<OutgoingMessage, "parseMode"> & { parseMode?: string; accountId?: string },
+  ): Promise<string> {
+    // For Telegram, pass accountId so the correct bot sends the message
+    if (adapter.name === "telegram" && msg.accountId) {
+      return (adapter as unknown as TelegramAdapter).send({
+        ...msg,
+        parseMode: msg.parseMode as any,
+        accountId: msg.accountId,
+      }) as Promise<string>
+    }
+    return (adapter.send(msg as any) || "") as Promise<string>
+  }
+
+  /** Whether an agent may emit rich `agentx:ui` messages on this channel.
+   *  Gated by per-agent `richMessages` (default true) and restricted to the
+   *  interactive chat channels that render buttons/polls natively. */
+  private richMessagesAllowed(agentId: string, channel: string): boolean {
+    if (channel !== "telegram" && channel !== "whatsapp") return false
+    const def = this.registry.getAgent(agentId) as { richMessages?: boolean } | undefined
+    return def?.richMessages !== false
+  }
+
+  /** Attach directive extras to a just-delivered reply: buttons onto the last
+   *  text message (edit reply_markup), poll + media as follow-up messages.
+   *  Best-effort — a failure here never breaks the text reply. */
+  /** Send files that appeared in the agent's outbox during a task into the
+   *  chat (Telegram), then remove them so they are never sent twice. Files
+   *  that fail to send stay in the outbox for the next task's pass. */
+  private async deliverOutboxFiles(
+    adapter: ChannelAdapter,
+    dir: string,
+    before: Map<string, number>,
+    target: { channel: string; chatId: string; accountId?: string; agentId?: string; replyTo?: string },
+  ): Promise<void> {
+    const now = snapshotOutbox(dir)
+    const fresh: string[] = []
+    for (const [name, mtime] of now) {
+      const prev = before.get(name)
+      if (prev === undefined || mtime > prev) fresh.push(name)
+    }
+    for (const name of fresh.slice(0, OUTBOX_MAX_FILES)) {
+      const path = join(dir, name)
+      try {
+        const st = statSync(path)
+        if (st.size > OUTBOX_MAX_BYTES) {
+          this.log(`Outbox file too large for Telegram, skipped: ${path} (${st.size} bytes)`)
+          continue
+        }
+        await this.adapterSend(adapter, {
+          channel: target.channel,
+          chatId: target.chatId,
+          text: "",
+          accountId: target.accountId,
+          agentId: target.agentId,
+          replyTo: target.replyTo,
+          media: { type: outboxMediaType(name), url: path, caption: name },
+        })
+        unlinkSync(path)
+        this.log(`Outbox delivered to ${target.channel}:${target.chatId}: ${name}`)
+      } catch (e: any) {
+        this.log(`Outbox send failed for ${path}: ${e.message}`)
+      }
+    }
+  }
+
+  private async attachUiExtras(
+    adapter: ChannelAdapter,
+    channel: string,
+    chatId: string,
+    lastMessageId: string | undefined,
+    ui: UiDirective,
+    accountId?: string,
+    agentId?: string,
+  ): Promise<void> {
+    try {
+      if (ui.buttons?.length && lastMessageId && adapter.name === "telegram") {
+        await (adapter as unknown as TelegramAdapter).setMessageButtons(chatId, lastMessageId, ui.buttons, accountId)
+      } else if (ui.buttons?.length) {
+        // Non-telegram or no anchor id — send buttons as their own message.
+        await this.adapterSend(adapter, { channel, chatId, text: "⌄", accountId, agentId, buttons: ui.buttons })
+      }
+      if (ui.poll) {
+        await this.adapterSend(adapter, {
+          channel, chatId, text: "", accountId, agentId,
+          poll: uiToOutgoing(ui).poll,
+        })
+      }
+      if (ui.media) {
+        await this.adapterSend(adapter, { channel, chatId, text: ui.media.caption ?? "", accountId, agentId, media: ui.media })
+      }
+    } catch (e: any) {
+      this.log(`attachUiExtras failed for ${channel}:${chatId}: ${e?.message || e}`)
+    }
+  }
+
+  private async adapterEdit(
+    adapter: ChannelAdapter,
+    chatId: string,
+    messageId: string,
+    text: string,
+    parseMode?: string,
+    accountId?: string,
+  ): Promise<boolean> {
+    if (adapter.name === "telegram" && accountId) {
+      return (adapter as unknown as TelegramAdapter).editMessage(chatId, messageId, text, parseMode, accountId)
+    }
+    return adapter.editMessage?.(chatId, messageId, text, parseMode) ?? false
+  }
+
+  private adapterReact(
+    adapter: ChannelAdapter,
+    chatId: string,
+    messageId: string,
+    emoji: string,
+    accountId?: string,
+    agentId?: string,
+  ): void {
+    if (adapter.name === "telegram" && accountId) {
+      (adapter as unknown as TelegramAdapter).react(chatId, messageId, emoji, accountId)
+    } else if (adapter.name === "gitlab" && agentId) {
+      // GitLab reactions carry an identity — post outcome emoji as the agent
+      // the note was routed to, not as whoever owns the global token.
+      (adapter as unknown as GitLabAdapter).react(chatId, messageId, emoji, agentId)
+    } else {
+      adapter.react?.(chatId, messageId, emoji)
+    }
+  }
+
+  /**
+   * Threads that have already been told about a mesh failure, keyed
+   * `${channel}:${chatId}`. Cleared on the next success for that thread, so a
+   * fresh outage notifies again but a burst inside one outage does not.
+   */
+  private meshFailureNotified = new Set<string>()
+
+  /**
+   * A mesh-routed task failed. React ❌ (as the agent, where the channel
+   * supports identity) and — the FIRST time this thread fails — post one
+   * short comment saying so.
+   *
+   * Why a comment at all: this used to be ❌-only, on the reasoning that
+   * transient failures would pollute the thread. In practice a reporter who
+   * @-mentions a bot and gets 👀 then silence assumes the bot is ignoring
+   * them and keeps re-pinging — on acme/soylent#46 that was 9 mentions over
+   * 74 minutes of upstream 529s, every one of them silently dropped. One
+   * comment per outage is far cheaper than that. Nothing retries on its own,
+   * so the text says plainly that a re-mention is what resumes it.
+   */
+  private notifyMeshFailure(
+    adapter: ChannelAdapter,
+    msg: IncomingMessage,
+    chatId: string,
+    agentId: string,
+    error: string,
+    replyAccountId?: string,
+  ): void {
+    this.adapterReact(adapter, chatId, msg.id, "❌", replyAccountId, agentId)
+
+    const key = `${msg.channel}:${chatId}`
+    if (this.meshFailureNotified.has(key)) {
+      this.log(`Mesh failure on ${key} already announced — suppressing repeat comment`)
+      return
+    }
+    this.meshFailureNotified.add(key)
+
+    const reason = cleanMeshError(error) || "an upstream error"
+    const text = `⚠️ I couldn't complete that — ${reason}\n\nNothing is retrying in the background. Mention me again and I'll pick it up.`
+    this.adapterSend(adapter, {
+      channel: msg.channel,
+      chatId,
+      text,
+      replyTo: msg.id,
+      parseMode: "plain",
+      accountId: replyAccountId,
+      agentId,
+    }).catch((e: any) => this.log(`Mesh failure notice failed to post on ${key}: ${e.message}`))
+  }
+
+  /**
+   * The peer's agent was busy on this chat, so the peer queued the message
+   * and answered with the registry's queued marker. That is an accepted
+   * message, not a failure: the peer's queue flush runs it when the current
+   * turn ends and posts the reply on the thread itself. So, as on the local
+   * path: no ❌, no failure comment, and the intent resolves as "queued".
+   *
+   * `meshFailureNotified` is left alone: nothing was announced, so there is
+   * nothing to mark, and the queued turn has not succeeded yet, so it is no
+   * reason to re-arm a notice already posted on this thread.
+   */
+  private noteMeshQueued(
+    msg: IncomingMessage,
+    peerName: string,
+    agentId: string,
+    queued: QueuedAnswer,
+    startedAt: number | null,
+  ): void {
+    this.log(`Message queued on peer "${peerName}" for ${agentId} (mode: ${queued.mode}, pending: ${queued.pending})`)
+    this.resolveIntent(msg, "queued", startedAt, `queued on ${peerName} (${queued.mode}, ${queued.pending} pending)`)
+  }
+
+  /** A mesh-routed task succeeded — re-arm the failure notice for this thread. */
+  private clearMeshFailure(channel: string, chatId: string): void {
+    this.meshFailureNotified.delete(`${channel}:${chatId}`)
+  }
+
+  private startTypingLoop(
+    adapter: ChannelAdapter,
+    chatId: string,
+    accountId?: string,
+  ): ReturnType<typeof setInterval> {
+    const sendTyping = () => {
+      if (adapter.name === "telegram" && accountId) {
+        (adapter as unknown as TelegramAdapter).sendTyping(chatId, accountId)
+      } else {
+        adapter.sendTyping?.(chatId)
+      }
+    }
+
+    sendTyping()
+    return setInterval(sendTyping, TYPING_INTERVAL_MS)
+  }
+
+  // --- Routing observability ---
+  //
+  // Every inbound message produces exactly one [route] log line, with the
+  // routing decision (match | drop), the deciding stage, and a reason.
+  // Goes to the daemon stderr log so the existing ~/.agentx/logs/ audit
+  // captures it. Also publishes on the event bus so SQLite writers,
+  // dashboards, and plugins can subscribe without touching this code.
+  private traceRoute(msg: IncomingMessage, kind: "match" | "drop", reason: string, decidingStage = "unknown", agentId?: string): void {
+    const chat = msg.group?.id || msg.sender?.id || "?"
+    this.log(
+      `[route] ${msg.channel}:${chat} msgId=${msg.id} acct=${msg.accountId ?? "—"} kind=${kind} ${reason}`,
+    )
+    const at = new Date().toISOString()
+    if (kind === "match" && agentId) {
+      getEventBus().emit("message:matched", {
+        channel: msg.channel,
+        chatId: String(chat),
+        msgId: msg.id,
+        accountId: msg.accountId,
+        agentId,
+        decidingStage,
+        at,
+      })
+    } else if (kind === "drop") {
+      getEventBus().emit("message:dropped", {
+        channel: msg.channel,
+        chatId: String(chat),
+        msgId: msg.id,
+        accountId: msg.accountId,
+        decidingStage,
+        reason,
+        at,
+      })
+    }
+  }
+
+  // --- Routing pipeline ---
+  //
+  // Phase 2: replaces the legacy resolveAgent() switch. The pipeline runs
+  // a fixed-order list of named stages (see src/channels/inbound/stages/);
+  // the first non-`pass` decision wins. resolveAgent() is kept as a thin
+  // delegate for callers that only need the agentId and don't care about
+  // the trace.
+  private runRoutingPipeline(msg: IncomingMessage): PipelineResult {
+    const env: InboundEnvelope = fromIncoming(msg)
+    return runPipeline(env, defaultPipeline, {
+      config: this.config,
+      registry: this.registry,
+      handoverStore: this.handoverStore,
+      hasAgent: (id) => !!this.registry.getAgent(id),
+      // An agent hosted on a peer that is merely *down* is still a known
+      // agent. Treating it as unknown is what turned a 24-minute peer flap
+      // into permanently dropped @-mentions; the message now matches here
+      // and is deferred downstream instead.
+      hasMeshAgent: (id) => !!this.mesh?.findAgentPeer(id),
+    })
+  }
+
+  // --- Agent resolution ---
+
+  /**
+   * Handle a message by routing to a mesh peer's agent.
+   * Searches peer agent cards for mention matches.
+   */
+  /** Build the context payload that mesh.sendTask forwards to the receiving
+   *  daemon's /task handler. Without this, the receiver runs registry.execute
+   *  with default channel="api"/chatId="default" — losing the channel,
+   *  project, issue id, sender, and channelMeta the original adapter built
+   *  from the inbound webhook. Shape matches what processResolvedMessage
+   *  already passes to registry.execute on the local path, so a mesh-routed
+   *  task and a locally-routed task produce the same session keying and
+   *  the same prompt context. */
+  private buildMeshContext(msg: IncomingMessage, chatId: string): Record<string, unknown> {
+    return {
+      channel: msg.channel,
+      sender: msg.sender.name,
+      senderId: msg.sender.id,
+      senderUsername: msg.sender.username,
+      group: msg.group?.name,
+      chatId,
+      mediaPath: msg.media?.path,
+      mediaType: msg.media?.type,
+      replyToText: msg.replyToText,
+      channelMeta: msg.channelMeta,
+      runbookPath: msg.runbookPath,
+      runbookFiles: msg.runbookFiles,
+    }
+  }
+
+  private async handleViaMesh(
+    adapter: ChannelAdapter,
+    msg: IncomingMessage,
+  ): Promise<boolean> {
+    if (!this.mesh) return false
+
+    const textLower = msg.text.toLowerCase()
+    const directory = this.mesh.directory()
+
+    for (const peer of directory) {
+      if (!peer.healthy) continue
+
+      for (const skill of peer.skills) {
+        // Check if the message mentions this remote agent by name or ID
+        if (
+          textLower.includes(skill.id.toLowerCase()) ||
+          textLower.includes(skill.name.toLowerCase())
+        ) {
+          this.log(`Mesh routing [${msg.channel}/${msg.sender.name}] -> peer "${peer.peer}" agent "${skill.id}"`)
+
+          const chatId = msg.group?.id || msg.sender.id
+          const replyAccountId = msg.accountId
+
+          // React + typing
+          this.adapterReact(adapter, chatId, msg.id, "👀", replyAccountId)
+          const typingTimer = this.startTypingLoop(adapter, chatId, replyAccountId)
+
+          try {
+            const response = await this.mesh.sendTask(peer.peer, msg.text, skill.id, {
+              context: this.buildMeshContext(msg, chatId),
+              replyVia: { messageId: msg.id, accountId: msg.accountId },
+            })
+
+            clearInterval(typingTimer)
+            this.clearMeshFailure(msg.channel, chatId)
+
+            if (response) {
+              // Prefix with remote agent name so user knows who's responding
+              const header = `**${skill.name}** _(${peer.peer})_:\n\n`
+              await this.adapterSend(adapter, {
+                channel: msg.channel,
+                chatId,
+                text: header + response,
+                replyTo: msg.id,
+                accountId: replyAccountId,
+                agentId: skill.id,
+              })
+            }
+
+            return true
+          } catch (e: any) {
+            clearInterval(typingTimer)
+            const queued = parseQueued(e.message)
+            if (queued) {
+              this.noteMeshQueued(msg, peer.peer, skill.id, queued, null)
+              return true
+            }
+            // Same policy as handleViaMeshByAgentId/handleViaMeshByPeer —
+            // react ❌ as the agent and announce once per thread.
+            this.log(`Mesh routing error for ${peer.peer}/${skill.id}: ${e.message}`)
+            this.notifyMeshFailure(adapter, msg, chatId, skill.id, e.message, replyAccountId)
+            return true
+          }
+        }
+      }
+    }
+
+    return false
+  }
+
+  /**
+   * Route to a mesh peer by resolved agentId (not text matching).
+   * Used when the channel adapter resolved the agent but it's not local.
+   */
+  private async handleViaMeshByAgentId(
+    adapter: ChannelAdapter,
+    msg: IncomingMessage,
+    agentId: string,
+  ): Promise<boolean> {
+    if (!this.mesh) return false
+
+    const directory = this.mesh.directory()
+
+    for (const peer of directory) {
+      if (!peer.healthy) continue
+
+      const skill = peer.skills.find(s => s.id === agentId)
+      if (!skill) continue
+
+      this.log(`Mesh routing by agentId [${msg.channel}/${msg.sender.name}] -> peer "${peer.peer}" agent "${agentId}"`)
+
+      const chatId = msg.group?.id || msg.sender.id
+      const replyAccountId = msg.accountId
+
+      this.adapterReact(adapter, chatId, msg.id, "👀", replyAccountId)
+      const typingTimer = this.startTypingLoop(adapter, chatId, replyAccountId)
+
+      const start = Date.now()
+      try {
+        const response = await this.mesh.sendTask(peer.peer, msg.text, agentId, {
+          context: this.buildMeshContext(msg, chatId),
+          replyVia: { messageId: msg.id, accountId: msg.accountId },
+        })
+        clearInterval(typingTimer)
+        this.clearMeshFailure(msg.channel, chatId)
+        this.resolveIntent(msg, "completed", start, response || null)
+
+        if (response) {
+          await this.adapterSend(adapter, {
+            channel: msg.channel,
+            chatId,
+            text: response,
+            replyTo: msg.id,
+            accountId: replyAccountId,
+            agentId,
+          })
+        }
+
+        return true
+      } catch (e: any) {
+        clearInterval(typingTimer)
+        const queued = parseQueued(e.message)
+        if (queued) {
+          this.noteMeshQueued(msg, peer.peer, agentId, queued, start)
+          return true
+        }
+        // Surface the real error in the local log (mesh.ts includes the peer's
+        // response body) and tell the thread once — see notifyMeshFailure for
+        // why ❌-only silence was worse than one comment.
+        this.log(`Mesh routing error for ${peer.peer}/${agentId}: ${e.message}`)
+        this.resolveIntent(msg, this.meshErrorStatus(e.message), start, e.message)
+        this.notifyMeshFailure(adapter, msg, chatId, agentId, e.message, replyAccountId)
+        return true
+      }
+    }
+
+    return false
+  }
+
+  /**
+   * Close the intent-ledger decision for a message this node forwarded to a
+   * mesh peer. Local tasks get their resolution from registry.execute; a
+   * mesh forward never reaches it, so without this the adapter's decision
+   * (e.g. gitlab:merge_request:target-default-route) stays "dispatched"
+   * forever — the activity graph shows it as running and active-task
+   * safety treats the (project, subject) slot as busy (#27).
+   */
+  private resolveIntent(
+    msg: IncomingMessage,
+    status: IntentResolutionStatus,
+    startedAt: number | null,
+    summary: string | null,
+  ): void {
+    if (!msg.intentRef) return
+    try {
+      getDefaultLedger().recordResolution({
+        decisionEventId: msg.intentRef.eventId,
+        decisionDecidedBy: msg.intentRef.decidedBy,
+        resolvedAt: Date.now(),
+        status,
+        durationMs: startedAt === null ? null : Date.now() - startedAt,
+        resultSummary: summary ? summary.slice(0, 200) : null,
+      })
+    } catch (e: any) {
+      // Non-fatal, same as registry.execute: a duplicate resolution or a
+      // broken ledger must not fail the channel reply.
+      this.log(`[ledger] resolution write failed for ${msg.intentRef.eventId}/${msg.intentRef.decidedBy}: ${e?.message ?? e}`)
+    }
+  }
+
+  private meshErrorStatus(message: string): IntentResolutionStatus {
+    return /timed out|timeout|abort/i.test(message) ? "timed-out" : "failed"
+  }
+
+  // --- Deferred mesh delivery ---
+
+  /**
+   * Hold a message addressed to an agent on an unreachable peer.
+   *
+   * Deduped by the same `<channel>:<accountId>:<id>` key the inbound dedupe
+   * uses, because the upstream that delivered the message often redelivers it
+   * while the peer is still down (GitLab retries its webhook), and we do not
+   * want the agent to answer the same mention twice on recovery.
+   */
+  private deferForPeer(
+    adapter: ChannelAdapter,
+    msg: IncomingMessage,
+    agentId: string,
+    peerName: string,
+  ): void {
+    const queue = this.deferredByPeer.get(peerName) || []
+    const key = `${msg.channel}:${msg.accountId || "default"}:${msg.id}`
+
+    if (queue.some((d) => d.key === key)) {
+      this.log(`[mesh-defer] duplicate for peer "${peerName}" agent "${agentId}" (${key}) — already held`)
+      return
+    }
+
+    if (queue.length >= this.MESH_DEFER_MAX_PER_PEER) {
+      const dropped = queue.shift()
+      if (dropped) this.resolveIntent(dropped.msg, "canceled", null, `mesh-defer: queue for peer "${peerName}" full`)
+      this.log(
+        `[mesh-defer] queue for peer "${peerName}" full (${this.MESH_DEFER_MAX_PER_PEER}) — ` +
+        `discarding oldest (${dropped?.key})`,
+      )
+    }
+
+    queue.push({ key, adapter, msg, agentId, peerName, deferredAt: Date.now() })
+    this.deferredByPeer.set(peerName, queue)
+    this.log(
+      `[mesh-defer] holding message for agent "${agentId}" until peer "${peerName}" returns ` +
+      `(${queue.length} held, TTL ${Math.round(this.MESH_DEFER_TTL_MS / 60000)}m)`,
+    )
+  }
+
+  /**
+   * Replay everything held for a peer that just came back.
+   *
+   * Runs sequentially: each entry is a real agent turn on the remote node,
+   * and firing a backlog at it in parallel would spike a node that has only
+   * just recovered. Entries older than the TTL are dropped rather than
+   * answered — a reply to a 40-minute-old mention is noise.
+   */
+  private async replayDeferred(peerName: string): Promise<void> {
+    const queue = this.deferredByPeer.get(peerName)
+    if (!queue?.length) return
+    this.deferredByPeer.delete(peerName)
+
+    const now = Date.now()
+    const live = queue.filter((d) => now - d.deferredAt < this.MESH_DEFER_TTL_MS)
+    const stale = queue.length - live.length
+    for (const d of queue) {
+      if (now - d.deferredAt >= this.MESH_DEFER_TTL_MS) {
+        this.resolveIntent(d.msg, "canceled", null, `mesh-defer: peer "${peerName}" back after TTL`)
+      }
+    }
+    if (stale > 0) {
+      this.log(`[mesh-defer] peer "${peerName}" back — discarding ${stale} message(s) past TTL`)
+    }
+    if (!live.length) return
+
+    this.log(`[mesh-defer] peer "${peerName}" back — replaying ${live.length} held message(s)`)
+
+    for (const d of live) {
+      try {
+        const routed = await this.handleViaMeshByPeer(d.adapter, d.msg, d.agentId, peerName)
+        if (routed) {
+          this.log(`[mesh-defer] replayed ${d.key} -> "${d.agentId}" on "${peerName}"`)
+        } else {
+          // Went down again mid-drain. Put it back so the next recovery
+          // picks it up; the TTL still bounds how long that can repeat.
+          this.log(`[mesh-defer] peer "${peerName}" unavailable again — re-holding ${d.key}`)
+          this.deferForPeer(d.adapter, d.msg, d.agentId, peerName)
+        }
+      } catch (e: any) {
+        this.log(`[mesh-defer] replay failed for ${d.key}: ${e?.message || e}`)
+      }
+    }
+  }
+
+  /** Held-message counts by peer — surfaced to the daemon for /health and
+   *  the dashboard so a growing backlog is visible rather than inferred. */
+  getDeferredMeshCounts(): Record<string, number> {
+    const out: Record<string, number> = {}
+    for (const [peer, queue] of this.deferredByPeer) {
+      if (queue.length) out[peer] = queue.length
+    }
+    return out
+  }
+
+  /**
+   * Route to a specific named mesh peer by agentId.
+   * Used when preferNode is set on the incoming message.
+   */
+  private async handleViaMeshByPeer(
+    adapter: ChannelAdapter,
+    msg: IncomingMessage,
+    agentId: string,
+    peerName: string,
+  ): Promise<boolean> {
+    if (!this.mesh) return false
+
+    const directory = this.mesh.directory()
+    const peer = directory.find(p => p.peer === peerName)
+
+    if (!peer || !peer.healthy) return false
+
+    this.log(`Mesh routing by preferNode [${msg.channel}/${msg.sender.name}] -> peer "${peerName}" agent "${agentId}"`)
+
+    const chatId = msg.group?.id || msg.sender.id
+    const replyAccountId = msg.accountId
+
+    this.adapterReact(adapter, chatId, msg.id, "👀", replyAccountId)
+    const typingTimer = this.startTypingLoop(adapter, chatId, replyAccountId)
+
+    const start = Date.now()
+    this.activeMeshForwards++
+    try {
+      const response = await this.mesh.sendTask(peerName, msg.text, agentId, {
+        context: this.buildMeshContext(msg, chatId),
+        replyVia: { messageId: msg.id, accountId: msg.accountId },
+      })
+      const duration = Date.now() - start
+      clearInterval(typingTimer)
+      this.clearMeshFailure(msg.channel, chatId)
+      this.resolveIntent(msg, "completed", start, response || null)
+
+      if (response) {
+        await this.adapterSend(adapter, {
+          channel: msg.channel,
+          chatId,
+          text: response,
+          replyTo: msg.id,
+          accountId: replyAccountId,
+          agentId,
+        })
+      }
+
+      if (msg.channel === "gitlab" && duration) {
+        const gitlabAdapter = this.channels.get("gitlab") as any
+        if (gitlabAdapter) {
+          gitlabAdapter.logTimeSpent(chatId, duration, agentId).catch((e: any) => {
+            this.log(`GitLab time tracking (mesh) failed: ${e.message}`)
+          })
+        }
+      }
+
+      return true
+    } catch (e: any) {
+      clearInterval(typingTimer)
+      const queued = parseQueued(e.message)
+      if (queued) {
+        this.noteMeshQueued(msg, peerName, agentId, queued, start)
+        return true
+      }
+      // See notifyMeshFailure — log the full error (includes the peer's
+      // response body via mesh.ts), react ❌ as the agent, and announce once.
+      this.log(`Mesh routing error for ${peerName}/${agentId}: ${e.message}`)
+      this.resolveIntent(msg, this.meshErrorStatus(e.message), start, e.message)
+      this.notifyMeshFailure(adapter, msg, chatId, agentId, e.message, replyAccountId)
+      return true
+    } finally {
+      this.activeMeshForwards--
+    }
+  }
+
+  private getAccountForAgent(agentId: string, groupId?: string): string | undefined {
+    const adapter = this.channels.get("telegram") as TelegramAdapter | undefined
+    return pickAccountForAgent(
+      this.config.channels.telegram.accounts,
+      agentId,
+      groupId,
+      adapter?.getGroupBotAccounts?.bind(adapter),
+    )
+  }
+
+  /** @deprecated Phase 2 — resolveAgent now delegates to the pipeline.
+   *  Kept as a thin wrapper for callers that only need the agentId; new
+   *  code should call runRoutingPipeline() to get the full PipelineResult
+   *  (deciding stage, drop reason, per-stage trace). */
+  private resolveAgent(msg: IncomingMessage): string | undefined {
+    return this.runRoutingPipeline(msg).agentId
+  }
+}

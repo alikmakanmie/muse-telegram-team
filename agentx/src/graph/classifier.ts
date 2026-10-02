@@ -1,0 +1,528 @@
+import { createHash } from "crypto"
+import { extractJson } from "@/utils/extract-json"
+import { GraphStore } from "./store"
+import {
+  type GraphSchema,
+  type GraphNode,
+  type Classification,
+} from "./types"
+import { createProvider, type ProviderName, type AgentProvider } from "@/agent/providers"
+import { getSeatMode } from "@/decisions/seat"
+import { INTENT_PATH_SEAT, proposePathViaSeat } from "@/decisions/seats/intent-path"
+
+/** A path for a cache miss, with where it came from. */
+interface Proposal {
+  path: string[]
+  proposedAxes: Record<string, Record<string, string>>
+  confidence?: number
+  leaf: { input?: string; output?: string }
+  source: "llm" | "seat"
+}
+
+// --- Intent Knowledge Graph classifier ---
+//
+// For every incoming message, returns a path through the taxonomy:
+//   1. fingerprint → cache hit → reuse path (0 LLM calls, source=cache)
+//   2. miss → LLM draftAgent proposes { path, axes } → validated → pending
+//   3. autoApproveConfidence met → committed + cached
+//
+// Pending paths are still usable immediately (caller tags artifacts with
+// them); approval flips the flag and populates the fingerprint index so
+// the next similar message hits the cache.
+
+export interface ClassifyInput {
+  text: string
+  channel?: string
+  sender?: string
+  /** Conversation id; stored on the classification so `agentx_wiki_query`
+   *  can look up the path of the request it is serving. */
+  chatId?: string
+  /** Agent that will RECEIVE the message after classification. When this
+   *  equals `draftAgent`, classification is skipped to prevent a deadlock —
+   *  the classifier's sub-task would otherwise queue behind the in-progress
+   *  main task on the same agent. */
+  agentId?: string
+}
+
+export interface ClassifyResult {
+  /** Node ids from root to leaf. Shorter-than-full paths are allowed. */
+  path: string[]
+  /** Stable hash of the path — used as the `graph:<pathId>` wiki tag. */
+  pathId: string
+  /** Human-readable "A › B › C" path for logs + UI. */
+  pathLabel: string
+  /** Axis values asserted by the classifier. Keyed by node id. */
+  axes: Record<string, Record<string, string>>
+  leaf: { input?: string; output?: string }
+  source: "cache" | "llm" | "seat"
+  status: "pending" | "approved"
+  confidence?: number
+}
+
+export type ApprovalStructurePolicy = "strict" | "extend-leaves" | "any"
+
+export interface ClassifierOptions {
+  store: GraphStore
+  /** Base URL of the daemon — used to POST /task for LLM proposals. */
+  daemonUrl: string
+  /** Optional bearer token for the daemon. */
+  token?: string
+  /** Which agent makes the proposal. Required if caller ever expects a
+   *  non-cached classification (cache hits work without an agent). */
+  draftAgent?: string
+  /** Structural approval policy — see config.ts for semantics. Default
+   *  "extend-leaves" (auto-approve pure reuse + single-leaf additions). */
+  autoApproveStructure?: ApprovalStructurePolicy
+  /** Minimum confidence (0..1) to commit without human approval. 1.0 = never.
+   *  OR'd with the structural policy. */
+  autoApproveConfidence?: number
+  /** Provider used for the in-process classifier call. Defaults to
+   *  "claude-code", which auto-detects auth via `loadAuthConfig()` —
+   *  Claude Max OAuth (CLI subprocess), API key, etc. NEVER opens a
+   *  paid path beyond what the operator has already configured. */
+  classifierProvider?: ProviderName
+  /** Model id passed to the provider. For claude-code OAuth this is
+   *  mapped through `CLI_MODEL_ALIASES` (sonnet/opus/haiku). Cheap
+   *  default — classification is metadata, not work. */
+  classifierModel?: string
+  log?: (...args: unknown[]) => void
+}
+
+export class Classifier {
+  private store: GraphStore
+  private daemonUrl: string
+  private token?: string
+  private draftAgent?: string
+  private autoApprove: number
+  private autoApproveStructure: ApprovalStructurePolicy
+  private classifierModel: string
+  private classifierProviderName: ProviderName
+  private providerInstance?: AgentProvider
+  private log: (...args: unknown[]) => void
+
+  constructor(opts: ClassifierOptions) {
+    this.store = opts.store
+    this.daemonUrl = opts.daemonUrl.replace(/\/+$/, "")
+    this.token = opts.token
+    this.draftAgent = opts.draftAgent
+    this.autoApprove = opts.autoApproveConfidence ?? 1.0
+    this.autoApproveStructure = opts.autoApproveStructure ?? "extend-leaves"
+    this.classifierModel = opts.classifierModel ?? "claude-haiku-4-5-20251001"
+    this.classifierProviderName = opts.classifierProvider ?? "claude-code"
+    this.log = opts.log ?? console.error.bind(console, "[classifier]")
+  }
+
+  /** Lazily build the provider instance. Lazy because constructing
+   *  ClaudeCodeProvider hits auth-store; deferring it keeps the
+   *  classifier importable in tests / dry-run paths that never call
+   *  classify(). */
+  private getProvider(): AgentProvider {
+    if (!this.providerInstance) {
+      this.providerInstance = createProvider(this.classifierProviderName)
+    }
+    return this.providerInstance
+  }
+
+  async classify(input: ClassifyInput): Promise<ClassifyResult | null> {
+    const fp = this.store.fingerprint({
+      text: input.text,
+      channel: input.channel,
+      sender: input.sender,
+    })
+
+    // 1. Cache hit — instant return, zero LLM. Logged to classifications.jsonl
+    //    so the cache-hit rate is measurable from the persisted record alone
+    //    (otherwise hits leave no trace and ROI of the classifier is invisible).
+    const cached = this.store.getFingerprint(fp)
+    if (cached) {
+      this.store.appendClassification({
+        ts: new Date().toISOString(),
+        msgHash: fp,
+        agentId: input.agentId,
+        channel: input.channel,
+        sender: input.sender,
+        chatId: input.chatId,
+        path: cached.path,
+        proposedAxes: {},
+        leaf: cached.leaf,
+        source: "cache",
+        status: "approved",
+        preview: input.text.slice(0, 200),
+      })
+      return {
+        path: cached.path,
+        pathId: hashPath(cached.path),
+        pathLabel: pathLabel(cached.path, this.store.loadNodes().nodes),
+        axes: {},
+        leaf: cached.leaf,
+        source: "cache",
+        status: "approved",
+      }
+    }
+
+    // 2. Cache miss — need an LLM proposal. Phase 2 of classifier-retire
+    //    replaced the /task → graph-agent dispatch with a direct Anthropic
+    //    Messages call, so we no longer need a draftAgent and the
+    //    self-dispatch deadlock guard (`agentId === draftAgent`) is moot.
+    //    `graph.enabled` is the only gate now.
+    const schema = this.store.loadSchema()
+    const nodes = this.store.loadNodes().nodes
+    const proposal = await this.propose(input, schema, nodes)
+    if (!proposal) return null
+
+    // 3. Validate + persist as pending. Any NEW node the LLM proposed is
+    //    only committed if the whole classification auto-approves below.
+    const { path, proposedAxes, confidence, leaf } = proposal
+    if (path.length === 0) return null
+
+    const classification: Classification = {
+      ts: new Date().toISOString(),
+      msgHash: fp,
+      agentId: input.agentId,
+      channel: input.channel,
+      sender: input.sender,
+      chatId: input.chatId,
+      path,
+      proposedAxes,
+      leaf,
+      source: proposal.source,
+      status: "pending",
+      confidence,
+      preview: input.text.slice(0, 200),
+    }
+
+    // --- Auto-approval policy (see config.ts for full semantics) ---
+    //
+    // Two conditions, OR'd. Either approves the classification:
+    //   1. Structure policy — what KIND of change the proposed path makes:
+    //        strict:        nothing auto — always pending
+    //        extend-leaves: auto if the path either (a) reuses only existing
+    //                       nodes, or (b) adds exactly one new node at the
+    //                       DEEPEST level (a new leaf). Structural changes
+    //                       (new mid-path or root node) still queue.
+    //        any:           auto regardless of structure.
+    //   2. Confidence — LLM-self-reported confidence >= autoApproveConfidence.
+    //
+    // Pending classifications still persist to the log, but don't commit nodes
+    // and don't populate the fingerprint cache (so similar messages re-query).
+    const existingIds = new Set(nodes.map((n) => n.id))
+    const newNodeIndices = path
+      .map((id, idx) => (existingIds.has(id) ? -1 : idx))
+      .filter((idx) => idx >= 0)
+
+    let structureOk = false
+    if (this.autoApproveStructure === "any") {
+      structureOk = true
+    } else if (this.autoApproveStructure === "extend-leaves") {
+      const isReuseOnly = newNodeIndices.length === 0
+      const isSingleLeafAddition =
+        newNodeIndices.length === 1 && newNodeIndices[0] === path.length - 1
+      structureOk = isReuseOnly || isSingleLeafAddition
+    }
+    const confidenceOk = confidence !== undefined && confidence >= this.autoApprove
+
+    let status: "pending" | "approved" = "pending"
+    if (structureOk || confidenceOk) {
+      // Commit any new nodes; if ANY fail schema validation (missing axes,
+      // bad ref, etc.) fall back to pending for the whole classification
+      // rather than half-committing the graph and bubbling the error up to
+      // the task handler.
+      try {
+        this.commitNewNodes(path, proposedAxes, schema, nodes, input.sender)
+        this.store.setFingerprint(fp, { path, leaf })
+        status = "approved"
+      } catch (e: any) {
+        this.log(
+          `auto-approve failed — staying pending ·`,
+          `path=${JSON.stringify(path)}`,
+          `reason=${(e?.message || e).toString().slice(0, 200)}`,
+        )
+      }
+    }
+    classification.status = status
+    this.store.appendClassification(classification)
+
+    return {
+      path,
+      pathId: hashPath(path),
+      pathLabel: pathLabel(path, this.store.loadNodes().nodes),
+      axes: proposedAxes,
+      leaf,
+      source: proposal.source,
+      status,
+      confidence,
+    }
+  }
+
+  /**
+   * Where a cache miss gets its path from, by the intent-path seat's mode:
+   *
+   *   off     the LLM, as before
+   *   shadow  the LLM decides; the seat runs afterwards with the LLM's path
+   *           as incumbent, so agreement is measured before it can act
+   *   active  the seat decides when both stages clear their thresholds;
+   *           the LLM only answers what the seat could not
+   *
+   * The seat reuses existing nodes only, so a seat proposal never adds to
+   * the taxonomy; the LLM keeps that role in every mode.
+   */
+  private async propose(
+    input: ClassifyInput,
+    schema: GraphSchema,
+    nodes: GraphNode[],
+  ): Promise<Proposal | null> {
+    const mode = getSeatMode(INTENT_PATH_SEAT)
+    const seatInput = { message: input.text, channel: input.channel, sender: input.sender, agent: input.agentId }
+
+    if (mode === "active") {
+      const viaSeat = await proposePathViaSeat(seatInput, nodes).catch((e) => {
+        this.log("intent-path seat failed:", e?.message || e)
+        return null
+      })
+      if (viaSeat?.confident) {
+        return { path: viaSeat.path, proposedAxes: {}, leaf: {}, confidence: viaSeat.confidence, source: "seat" }
+      }
+    }
+
+    const viaLlm = await this.proposePath(input, schema, nodes).catch((e) => {
+      this.log("LLM proposal failed:", e?.message || e)
+      return null
+    })
+    if (mode === "shadow" && viaLlm) {
+      void proposePathViaSeat(seatInput, nodes, { incumbent: viaLlm.path }).catch(() => {})
+    }
+    return viaLlm ? { ...viaLlm, source: "llm" } : null
+  }
+
+  /** Direct call to Anthropic to propose a path. Pure I/O; no side effects.
+   *  Bypasses the mesh / dispatch / ledger pipeline so a classification
+   *  doesn't surface as a sibling task in the activity graph. */
+  private async proposePath(
+    input: ClassifyInput,
+    schema: GraphSchema,
+    nodes: GraphNode[],
+  ): Promise<{
+    path: string[]
+    proposedAxes: Record<string, Record<string, string>>
+    confidence?: number
+    leaf: { input?: string; output?: string }
+  } | null> {
+    const nodesForPrompt = nodes.map((n) => ({
+      id: n.id,
+      level: n.level,
+      parentId: n.parentId,
+      axes: n.axes,
+    }))
+    const userPrompt = [
+      `You are the intent classifier for AgentX. You answer ONE question:`,
+      `"what kind of work does this message describe?" — verb-level only.`,
+      ``,
+      `IMPORTANT — what NOT to encode in the path:`,
+      `- Client / company / project / team names. Those are already on the event`,
+      `  metadata (project, channel, agentId). Embedding them in the path causes`,
+      `  duplicate nodes (one per client) for the same verb.`,
+      `- The specific subject (issue number, file name, person name). Same reason.`,
+      `- The agent's name or role. Pick the verb the *requester* intended.`,
+      ``,
+      `SCHEMA (fixed levels — pick one node per level):`,
+      "```json",
+      JSON.stringify(schema, null, 2),
+      "```",
+      ``,
+      `EXISTING NODES (prefer reusing these; only invent a new node when no`,
+      `existing one fits):`,
+      "```json",
+      JSON.stringify(nodesForPrompt, null, 2),
+      "```",
+      ``,
+      `MESSAGE:`,
+      "```",
+      input.text.slice(0, 2000),
+      "```",
+      `channel: ${input.channel ?? "?"}`,
+      `sender: ${input.sender ?? "?"}`,
+      ``,
+      `TASK:`,
+      `1. Classify into 'category' (closed enum): code, ops, support, admin,`,
+      `   knowledge, social, system. Pick the closest fit.`,
+      `2. Pick or propose a 'verb' node. Verb ids are dot-namespaced lower-kebab,`,
+      `   e.g. "review.merge-request", "deploy.staging", "investigate.error",`,
+      `   "chat.greeting", "fix.bug". Reuse an existing verb when the message is`,
+      `   the same kind of work as something already classified, even when the`,
+      `   client / project / subject differs.`,
+      ``,
+      `Examples (right vs wrong):`,
+      `- "Please review MR #957 on globex/system" → ["code", "review.merge-request"]`,
+      `   NOT ["business", "acme", "globex-v2", "review-mr-957-system"]`,
+      `- "Deploy initech-v2 to staging please" → ["ops", "deploy.staging"]`,
+      `   NOT ["business", "acme", "initech-v2", "deploy-initech-v2-to-staging"]`,
+      `- "Hello Atlas" → ["support", "chat.greeting"]`,
+      ``,
+      `NODE ID RULES (strict — invalid ids get dropped):`,
+      `- lowercase-kebab + dots only: [a-z0-9][a-z0-9._-]*`,
+      `- no spaces, no uppercase, no Arabic/other non-Latin`,
+      `- verb ids should use a "category.specific" or "verb.modifier" shape`,
+      ``,
+      `Return ONE JSON object on one line, no prose, no fences:`,
+      `  { "path": string[], "proposedAxes": { [nodeId]: { [axisName]: string } }, "leaf": { "input"?: string, "output"?: string }, "confidence": number }`,
+      `confidence in [0,1]. Prefer low confidence over guessing.`,
+    ].join("\n")
+
+    // Phase 2 of classifier-retire: in-process provider call.
+    // Replaces the `/task → graph-agent → mesh` dispatch path that
+    // generated a sibling ledger event per classification (60–70% of
+    // dispatches in the activity graph). Reuses whatever auth the
+    // operator already configured (Claude Max OAuth via CLI subprocess,
+    // Anthropic API key, etc.) — never opens a paid path the operator
+    // didn't already opt into. The provider returns a plain JSON-text
+    // GenerationResult, so we parse the same way as before.
+    const text = await this.callProvider(userPrompt)
+    const parsed = extractJson(text)
+    if (!parsed || !Array.isArray(parsed.path)) return null
+
+    // LLM often returns human-readable labels ("Business", "Sales Manager").
+    // The node-id schema requires a lowercase slug, so normalize here and
+    // remember the original → slug mapping so proposedAxes stays attached.
+    // We also drop any element that can't be slugified into a valid id (e.g.
+    // a path entry of pure Arabic script) — better to classify with a shorter
+    // path than to have the store reject the whole classification.
+    const NODE_ID_RE = /^[a-z0-9][a-z0-9._-]*$/
+    const slugMap = new Map<string, string>()
+    const path: string[] = parsed.path
+      .filter((s: unknown): s is string => typeof s === "string" && s.length > 0)
+      .map((s: string) => {
+        const trimmed = s.trim()
+        const slugged = slugifyNodeId(trimmed)
+        if (trimmed !== slugged) slugMap.set(trimmed, slugged)
+        return slugged
+      })
+      .filter((s: string) => NODE_ID_RE.test(s))
+    if (path.length === 0) return null
+
+    const proposedAxes: Record<string, Record<string, string>> = {}
+    if (parsed.proposedAxes && typeof parsed.proposedAxes === "object") {
+      for (const [rawNodeId, axes] of Object.entries(parsed.proposedAxes as Record<string, any>)) {
+        if (!axes || typeof axes !== "object") continue
+        const nodeId = slugMap.get(rawNodeId) ?? slugifyNodeId(rawNodeId)
+        if (!nodeId) continue
+        const clean: Record<string, string> = {}
+        for (const [k, v] of Object.entries(axes)) {
+          if (typeof v === "string") clean[k] = v
+        }
+        // If the LLM didn't volunteer a human-readable name but we slugified
+        // one away, preserve the original as a `name` axis so the UI can
+        // render "Sales Manager" not "sales-manager".
+        if (!clean.name && rawNodeId !== nodeId) clean.name = rawNodeId.trim()
+        proposedAxes[nodeId] = clean
+      }
+    }
+
+    const leaf: { input?: string; output?: string } = {}
+    if (parsed.leaf && typeof parsed.leaf === "object") {
+      if (typeof parsed.leaf.input === "string") leaf.input = parsed.leaf.input
+      if (typeof parsed.leaf.output === "string") leaf.output = parsed.leaf.output
+    }
+
+    const confidence = typeof parsed.confidence === "number"
+      ? Math.max(0, Math.min(1, parsed.confidence))
+      : undefined
+
+    return { path, proposedAxes, confidence, leaf }
+  }
+
+  /** Create any nodes along `path` that don't exist yet. Delegates to the
+   *  store so level inference (for paths that skip levels) + fresh reloads
+   *  between adds are shared with the review path. */
+  private commitNewNodes(
+    path: string[],
+    proposedAxes: Record<string, Record<string, string>>,
+    schema: GraphSchema,
+    _existing: GraphNode[],
+    createdBy?: string,
+  ): void {
+    this.store.commitNodesAlongPath(path, proposedAxes, schema, createdBy)
+  }
+
+  /** Run the prompt through whichever AgentProvider the operator already
+   *  configured (Claude Max subscription via CLI, Anthropic API key, …).
+   *  Hard rule: NEVER open a paid path the operator didn't opt into —
+   *  this is just a thin wrapper that reuses existing auth. 30s timeout
+   *  is enough for Haiku/CLI cold-start; any longer and the classifier
+   *  is stalling the caller. */
+  private async callProvider(userPrompt: string): Promise<string> {
+    const provider = this.getProvider()
+    const ac = new AbortController()
+    const timer = setTimeout(() => ac.abort(), 30_000)
+    try {
+      const res = await provider.generate(
+        [
+          {
+            role: "system",
+            content:
+              "You are a taxonomy classifier. Respond with a single JSON object on one line. No prose, no code fences.",
+          },
+          { role: "user", content: userPrompt },
+        ],
+        { model: this.classifierModel, maxTokens: 800, abortSignal: ac.signal, bare: true },
+      )
+      return res.content || ""
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+}
+
+/** Normalize an LLM-proposed node label to a valid node id. Matches the
+ *  schema's `^[a-z0-9][a-z0-9._-]*$` — lowercase, alnum/./-/_, leading alnum.
+ *  Dots are preserved for verb ids like "review.merge-request". */
+function slugifyNodeId(raw: string): string {
+  const s = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "")
+    .replace(/-{2,}/g, "-")
+  if (!s) return ""
+  // Ensure leading char is alnum (schema rejects leading _ or -).
+  return /^[a-z0-9]/.test(s) ? s : `n-${s}`.replace(/[-_]+$/, "")
+}
+
+// --- path helpers used by both classifier + wiki retrieval ---
+
+/** Deterministic hash of a path, used as the `graph:<pathId>` wiki tag. */
+export function hashPath(path: string[]): string {
+  return createHash("sha1")
+    .update(path.join("\u0001"))
+    .digest("hex")
+    .slice(0, 16)
+}
+
+/** "Business › Acme › DevOps › Review MR" — for the UI + context render. */
+export function pathLabel(path: string[], nodes: GraphNode[]): string {
+  return path
+    .map((id) => {
+      const n = nodes.find((x) => x.id === id)
+      if (!n) return id
+      // Prefer a `name` axis when the schema has one; fall back to id.
+      const name = n.axes?.name || n.axes?.what || id
+      return name
+    })
+    .join(" › ")
+}
+
+/**
+ * Depth of the deepest common ancestor between two paths, normalized to [0,1].
+ * Used to score wiki articles: exact match = 1, shared grandparent = 0.5, none = 0.
+ */
+export function ancestryScore(a: string[], b: string[]): number {
+  if (a.length === 0 || b.length === 0) return 0
+  let shared = 0
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] === b[i]) shared++
+    else break
+  }
+  if (shared === 0) return 0
+  const depth = Math.max(a.length, b.length)
+  return shared / depth
+}
+

@@ -1,0 +1,519 @@
+import type Database from "better-sqlite3"
+import { newEventId } from "@/intent/ulid"
+import { boundInjectedContext } from "@/agents/injected-context"
+
+// --- Task trace store ---
+//
+// Improvement plan #2 — per-task observability backed by SQLite. One
+// task_traces row per executeTask invocation, an append-only stream of
+// task_trace_steps inside it. The store is intentionally dumb: it stores
+// what callers give it. Callers (capture sites in src/agents/runtime.ts)
+// are responsible for byte-capping large step payloads so the daemon
+// memory stays bounded under tool-heavy turns.
+//
+// Why a separate store layer (vs writing inline in runtime.ts)?
+//   - Tests can exercise the trace lifecycle against a temp SQLite without
+//     spinning up the agent runtime.
+//   - The HTTP endpoints (GET /task/:id/trace) read through the same
+//     functions producers write through, so there's a single source of
+//     truth on field names + semantics.
+//   - Future capture sites (sdk tier, orchestrator tier) reuse this API
+//     without copying SQL.
+//
+// Why ULID for task_id?
+//   - URL-safe in HTTP routes (GET /task/:id/trace).
+//   - Time-sortable, so listTraces ORDER BY started_at and ORDER BY
+//     task_id agree without an explicit timestamp column index.
+//   - Already in-tree (src/intent/ulid.ts); no new dep.
+//
+// Cross-DB FK note:
+//   intent_event_id and intent_decided_by are logical foreign keys into
+//   the intent ledger at .agentx/intent/ledger.sqlite. better-sqlite3
+//   doesn't enforce cross-database FKs and we don't ATTACH the ledger
+//   here on purpose — the rescue plan's append-only contract on the
+//   ledger is honoured by routing all writes through src/intent/ledger.ts.
+//   Joins happen at the HTTP / CLI layer when needed.
+
+export interface TraceStartInput {
+  agentId: string
+  channel?: string | null
+  chatId?: string | null
+  messagePreview?: string | null
+  /** Full untruncated user message — used by `agentx trace replay <taskId>`
+   *  to re-fire a recorded task against the current agent config. NULL on
+   *  rows from before migration v8, in which case replay falls back to
+   *  messagePreview (which is capped at 200 chars). */
+  originalMessage?: string | null
+  workflowRunId?: string | null
+  workflowId?: string | null
+  workflowNodeId?: string | null
+  intentEventId?: string | null
+  intentDecidedBy?: string | null
+  resumeSessionId?: string | null
+  model?: string | null
+  /** How to re-enter this run after a restart (JSON, see agents/resume). */
+  resumeOrigin?: string | null
+  /** 0 for a fresh run; n for the n-th resume of a cut-off run. */
+  resumeAttempt?: number | null
+  /** The cut-off run this one continues. */
+  resumedFrom?: string | null
+}
+
+export interface TraceEndInput {
+  status: "ok" | "error" | "timeout"
+  finalSessionId?: string | null
+  inputTokens?: number | null
+  outputTokens?: number | null
+  cacheReadTokens?: number | null
+  cacheCreateTokens?: number | null
+  tier2InputTokens?: number | null
+  tier2OutputTokens?: number | null
+  tier2CacheReadTokens?: number | null
+  tier2CacheCreateTokens?: number | null
+  /** Whether the turn continued a provider session. The resume decision
+   *  is made after task:started, so it is recorded at the end. Omitted
+   *  leaves both resumed and resume_session_id untouched. */
+  resumed?: boolean | null
+  resumeSessionId?: string | null
+  /** Request-gate experiment arm: "treatment" | "holdout". */
+  jevArm?: string | null
+  /** Runtime-reported turn count (Claude `num_turns`). */
+  numTurns?: number | null
+  /** Lessons injected into the prompt. See InjectedContext. */
+  injectedContext?: InjectedContext | null
+  error?: string | null
+  /** The agent's final reply text. Stored verbatim so `replay --diff`
+   *  can compare original output vs the new run's output without
+   *  reconstructing it from the step ledger. NULL when the response
+   *  wasn't captured (older rows or non-text outputs). */
+  finalResponse?: string | null
+}
+
+/** Ids of the lessons injected into one task's prompt. Memory facts and
+ *  procedures are matched per message, so their ids are recorded; the wiki
+ *  is injected as a whole catalog, so only its presence is. */
+export interface InjectedContext {
+  memory: string[]
+  procedures: string[]
+  wiki: boolean
+}
+
+export interface TraceStepInput {
+  /** Coarse step kind. Conventional values: "tool_use" | "tool_result" |
+   *  "llm_message" | "session_rotation" | "error" | "preflight". Free-form
+   *  strings allowed so future capture sites don't need a schema bump. */
+  name: string
+  /** Fine-grained name within the kind. For "tool_use", this is the tool
+   *  name (e.g. "Bash", "Edit"). Optional. */
+  action?: string | null
+  status?: "ok" | "error" | "in-flight" | null
+  /** JSON-stringified input or human-readable summary. Caller-byte-capped. */
+  inputSummary?: string | null
+  outputSummary?: string | null
+  error?: string | null
+  /** Step duration when known. Optional — many step kinds are point-in-time. */
+  ms?: number | null
+}
+
+export interface TraceRecord {
+  taskId: string
+  agentId: string
+  channel: string | null
+  chatId: string | null
+  workflowRunId: string | null
+  workflowId: string | null
+  workflowNodeId: string | null
+  intentEventId: string | null
+  intentDecidedBy: string | null
+  resumeSessionId: string | null
+  finalSessionId: string | null
+  model: string | null
+  status: string
+  startedAt: number
+  finishedAt: number | null
+  durationMs: number | null
+  inputTokens: number | null
+  outputTokens: number | null
+  cacheReadTokens: number | null
+  cacheCreateTokens: number | null
+  tier2InputTokens: number | null
+  tier2OutputTokens: number | null
+  tier2CacheReadTokens: number | null
+  tier2CacheCreateTokens: number | null
+  /** NULL on rows recorded before migration v12. */
+  resumed: boolean | null
+  /** NULL when the request gate was not active (or before migration v13). */
+  jevArm: string | null
+  /** NULL on rows recorded before lesson-impact capture (#98) or when the
+   *  runtime does not report a turn count. */
+  numTurns: number | null
+  /** NULL on rows recorded before lesson-impact capture (#98). */
+  injectedContext: InjectedContext | null
+  error: string | null
+  messagePreview: string | null
+  /** Full untruncated user message — populated for traces from migration v8
+   *  onward. NULL on older rows; consumers should fall back to messagePreview. */
+  originalMessage: string | null
+  /** Agent's final reply text — populated for traces from migration v8
+   *  onward when the executor records it on end. */
+  finalResponse: string | null
+}
+
+export interface TraceStepRecord {
+  taskId: string
+  seq: number
+  name: string
+  action: string | null
+  status: string | null
+  inputSummary: string | null
+  outputSummary: string | null
+  error: string | null
+  ms: number | null
+  startedAt: number
+}
+
+export interface ListTracesFilters {
+  agentId?: string
+  channel?: string
+  chatId?: string
+  workflowRunId?: string
+  status?: string
+  /** ms epoch */
+  since?: number
+  /** ms epoch */
+  until?: number
+  /** Default 100, capped at 1000. */
+  limit?: number
+}
+
+/**
+ * Insert an in-flight trace row and return its ULID. Callers thread the
+ * returned id through the executor and call recordTraceEnd at finish time.
+ *
+ * `taskId` is optional — when supplied, the caller has already allocated
+ * a ULID upstream (e.g. registry.execute generating it before the bus
+ * event so the runtime can capture per-step rows under the same id).
+ * When omitted, a fresh ULID is allocated here.
+ */
+export function recordTraceStart(
+  db: Database.Database,
+  input: TraceStartInput,
+  taskId: string = newEventId(),
+): string {
+  db.prepare(`
+    INSERT INTO task_traces (
+      task_id, agent_id, channel, chat_id, workflow_run_id, workflow_id,
+      workflow_node_id, intent_event_id, intent_decided_by, resume_session_id,
+      model, status, started_at, message_preview, original_message,
+      resume_origin, resume_attempt, resumed_from
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in-flight', ?, ?, ?, ?, ?, ?)
+  `).run(
+    taskId,
+    input.agentId,
+    input.channel ?? null,
+    input.chatId ?? null,
+    input.workflowRunId ?? null,
+    input.workflowId ?? null,
+    input.workflowNodeId ?? null,
+    input.intentEventId ?? null,
+    input.intentDecidedBy ?? null,
+    input.resumeSessionId ?? null,
+    input.model ?? null,
+    Date.now(),
+    input.messagePreview ?? null,
+    input.originalMessage ?? null,
+    input.resumeOrigin ?? null,
+    input.resumeAttempt ?? 0,
+    input.resumedFrom ?? null,
+  )
+  return taskId
+}
+
+/**
+ * Finalize a trace. duration_ms is computed from finished_at - started_at
+ * inside the UPDATE so the two columns can never disagree. Idempotent —
+ * calling twice on the same task_id overwrites the prior end values; the
+ * second call's status wins. (Soft-overwrite is intentional: timeout
+ * handlers may write before a late stream-completion arrives.)
+ */
+export function recordTraceEnd(db: Database.Database, taskId: string, input: TraceEndInput): void {
+  const finishedAt = Date.now()
+  db.prepare(`
+    UPDATE task_traces SET
+      status = ?,
+      final_session_id = ?,
+      input_tokens = ?,
+      output_tokens = ?,
+      cache_read_tokens = ?,
+      cache_create_tokens = ?,
+      tier2_input_tokens = ?,
+      tier2_output_tokens = ?,
+      tier2_cache_read_tokens = ?,
+      tier2_cache_create_tokens = ?,
+      resumed = COALESCE(?, resumed),
+      resume_session_id = COALESCE(?, resume_session_id),
+      jev_arm = COALESCE(?, jev_arm),
+      num_turns = COALESCE(?, num_turns),
+      injected_context = COALESCE(?, injected_context),
+      error = ?,
+      final_response = COALESCE(?, final_response),
+      finished_at = ?,
+      duration_ms = ? - started_at
+    WHERE task_id = ?
+  `).run(
+    input.status,
+    input.finalSessionId ?? null,
+    input.inputTokens ?? null,
+    input.outputTokens ?? null,
+    input.cacheReadTokens ?? null,
+    input.cacheCreateTokens ?? null,
+    input.tier2InputTokens ?? null,
+    input.tier2OutputTokens ?? null,
+    input.tier2CacheReadTokens ?? null,
+    input.tier2CacheCreateTokens ?? null,
+    input.resumed == null ? null : input.resumed ? 1 : 0,
+    input.resumeSessionId ?? null,
+    input.jevArm ?? null,
+    input.numTurns ?? null,
+    input.injectedContext ? JSON.stringify(boundInjectedContext(input.injectedContext)) : null,
+    input.error ?? null,
+    input.finalResponse ?? null,
+    finishedAt,
+    finishedAt,
+    taskId,
+  )
+}
+
+/**
+ * Append a step. seq is auto-allocated as MAX(seq)+1 within a transaction
+ * so concurrent step writes for the same task_id can't collide. Returns
+ * the assigned seq, useful for downstream correlation.
+ */
+export function recordTraceStep(db: Database.Database, taskId: string, input: TraceStepInput): number {
+  const startedAt = Date.now()
+  const allocateAndInsert = db.transaction((): number => {
+    const row = db
+      .prepare("SELECT MAX(seq) AS max_seq FROM task_trace_steps WHERE task_id = ?")
+      .get(taskId) as { max_seq: number | null } | undefined
+    const seq = ((row?.max_seq ?? -1) as number) + 1
+    db.prepare(`
+      INSERT INTO task_trace_steps (
+        task_id, seq, name, action, status, input_summary, output_summary, error, ms, started_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      taskId,
+      seq,
+      input.name,
+      input.action ?? null,
+      input.status ?? null,
+      input.inputSummary ?? null,
+      input.outputSummary ?? null,
+      input.error ?? null,
+      input.ms ?? null,
+      startedAt,
+    )
+    return seq
+  })
+  return allocateAndInsert()
+}
+
+export function parseInjectedContext(raw: unknown): InjectedContext | null {
+  if (typeof raw !== "string") return null
+  try {
+    const v = JSON.parse(raw)
+    if (!v || typeof v !== "object") return null
+    const ids = (x: unknown) => (Array.isArray(x) ? x.filter((i): i is string => typeof i === "string") : [])
+    return { memory: ids(v.memory), procedures: ids(v.procedures), wiki: v.wiki === true }
+  } catch {
+    return null
+  }
+}
+
+function rowToTrace(row: Record<string, unknown>): TraceRecord {
+  return {
+    taskId: row.task_id as string,
+    agentId: row.agent_id as string,
+    channel: (row.channel as string) ?? null,
+    chatId: (row.chat_id as string) ?? null,
+    workflowRunId: (row.workflow_run_id as string) ?? null,
+    workflowId: (row.workflow_id as string) ?? null,
+    workflowNodeId: (row.workflow_node_id as string) ?? null,
+    intentEventId: (row.intent_event_id as string) ?? null,
+    intentDecidedBy: (row.intent_decided_by as string) ?? null,
+    resumeSessionId: (row.resume_session_id as string) ?? null,
+    finalSessionId: (row.final_session_id as string) ?? null,
+    model: (row.model as string) ?? null,
+    status: row.status as string,
+    startedAt: row.started_at as number,
+    finishedAt: (row.finished_at as number) ?? null,
+    durationMs: (row.duration_ms as number) ?? null,
+    inputTokens: (row.input_tokens as number) ?? null,
+    outputTokens: (row.output_tokens as number) ?? null,
+    cacheReadTokens: (row.cache_read_tokens as number) ?? null,
+    cacheCreateTokens: (row.cache_create_tokens as number) ?? null,
+    tier2InputTokens: (row.tier2_input_tokens as number) ?? null,
+    tier2OutputTokens: (row.tier2_output_tokens as number) ?? null,
+    tier2CacheReadTokens: (row.tier2_cache_read_tokens as number) ?? null,
+    tier2CacheCreateTokens: (row.tier2_cache_create_tokens as number) ?? null,
+    resumed: row.resumed == null ? null : row.resumed === 1,
+    jevArm: (row.jev_arm as string) ?? null,
+    numTurns: (row.num_turns as number) ?? null,
+    injectedContext: parseInjectedContext(row.injected_context),
+    error: (row.error as string) ?? null,
+    messagePreview: (row.message_preview as string) ?? null,
+    originalMessage: (row.original_message as string) ?? null,
+    finalResponse: (row.final_response as string) ?? null,
+  }
+}
+
+function rowToStep(row: Record<string, unknown>): TraceStepRecord {
+  return {
+    taskId: row.task_id as string,
+    seq: row.seq as number,
+    name: row.name as string,
+    action: (row.action as string) ?? null,
+    status: (row.status as string) ?? null,
+    inputSummary: (row.input_summary as string) ?? null,
+    outputSummary: (row.output_summary as string) ?? null,
+    error: (row.error as string) ?? null,
+    ms: (row.ms as number) ?? null,
+    startedAt: row.started_at as number,
+  }
+}
+
+/** Fetch a trace + its ordered steps. Returns null if no such task_id. */
+export function getTrace(
+  db: Database.Database,
+  taskId: string,
+): { task: TraceRecord; steps: TraceStepRecord[] } | null {
+  const row = db.prepare("SELECT * FROM task_traces WHERE task_id = ?").get(taskId) as
+    | Record<string, unknown>
+    | undefined
+  if (!row) return null
+  const stepRows = db
+    .prepare("SELECT * FROM task_trace_steps WHERE task_id = ? ORDER BY seq")
+    .all(taskId) as Record<string, unknown>[]
+  return { task: rowToTrace(row), steps: stepRows.map(rowToStep) }
+}
+
+/**
+ * Cancel any in-flight trace rows left over from a previous daemon
+ * lifetime. Mirrors the intent ledger's startup cleanup (rescue plan
+ * Phase 1 commit a8514d9): a hard-killed daemon never gets to fire
+ * task:completed, so the row sits "in-flight" forever and contaminates
+ * triage queries (`agentx trace list --status in-flight`) with stale
+ * orphans. Run once at daemon boot before subscribers attach.
+ *
+ * Returns the number of rows updated. duration_ms is intentionally NOT
+ * computed — we don't know when the task actually ended; preserving
+ * NULL there is more honest than backdating to "now".
+ */
+export function cleanupOrphanedTraces(db: Database.Database): number {
+  const now = Date.now()
+  const r = db.prepare(`
+    UPDATE task_traces
+       SET status = 'canceled',
+           error = 'daemon-restart (orphaned in-flight)',
+           finished_at = ?
+     WHERE status = 'in-flight'
+  `).run(now)
+  return (r.changes ?? 0) as number
+}
+
+// --- Resume after restart (#103) -------------------------------------------
+
+/** A run that was still going when the previous daemon stopped. */
+export interface InterruptedRun {
+  taskId: string
+  agentId: string
+  channel: string | null
+  chatId: string | null
+  workflowRunId: string | null
+  startedAt: number
+  originalMessage: string | null
+  resumeOrigin: string | null
+  resumeAttempt: number
+  /** Tool calls it had made, in order, for the resume note. */
+  toolCalls: Array<{ action: string | null; inputSummary: string | null }>
+}
+
+/** Close every run left in flight by the previous daemon, marking it
+ *  `interrupted` for the resume planner, and return them. One transaction,
+ *  so a second process booting on the same database gets nothing. */
+export function takeInterruptedRuns(db: Database.Database, now = Date.now()): InterruptedRun[] {
+  const take = db.transaction(() => {
+    const rows = db.prepare(`
+      SELECT task_id, agent_id, channel, chat_id, workflow_run_id, started_at,
+             original_message, resume_origin, resume_attempt
+        FROM task_traces WHERE status = 'in-flight' ORDER BY started_at
+    `).all() as Array<Record<string, any>>
+    db.prepare(`
+      UPDATE task_traces
+         SET status = 'canceled', error = 'daemon-restart (interrupted)',
+             finished_at = ?, resume_decision = 'interrupted'
+       WHERE status = 'in-flight'
+    `).run(now)
+    return rows
+  })
+  const steps = db.prepare(`
+    SELECT action, input_summary FROM task_trace_steps
+     WHERE task_id = ? AND name = 'tool_use' ORDER BY seq
+  `)
+  return take().map((r) => ({
+    taskId: r.task_id,
+    agentId: r.agent_id,
+    channel: r.channel ?? null,
+    chatId: r.chat_id ?? null,
+    workflowRunId: r.workflow_run_id ?? null,
+    startedAt: r.started_at,
+    originalMessage: r.original_message ?? null,
+    resumeOrigin: r.resume_origin ?? null,
+    resumeAttempt: r.resume_attempt ?? 0,
+    toolCalls: (steps.all(r.task_id) as Array<Record<string, any>>).map((s) => ({
+      action: s.action ?? null, inputSummary: s.input_summary ?? null,
+    })),
+  }))
+}
+
+/** Claim an interrupted run before deciding what to do with it. Returns
+ *  false when another process already claimed or decided it, so a run is
+ *  never resumed — or its chat told — twice. */
+export function claimResume(db: Database.Database, taskId: string): boolean {
+  const r = db.prepare(`
+    UPDATE task_traces SET resume_decision = 'deciding'
+     WHERE task_id = ? AND resume_decision = 'interrupted'
+  `).run(taskId)
+  return (r.changes ?? 0) === 1
+}
+
+export type ResumeDecision = "resumed" | "reported" | "skipped" | "resume-failed"
+
+export function recordResumeDecision(
+  db: Database.Database, taskId: string, decision: ResumeDecision, reason: string,
+): void {
+  db.prepare("UPDATE task_traces SET resume_decision = ?, resume_reason = ? WHERE task_id = ?")
+    .run(decision, reason.slice(0, 500), taskId)
+}
+
+/** Triage / dashboard surface — list traces newest-first, filtered. */
+export function listTraces(db: Database.Database, filters: ListTracesFilters = {}): TraceRecord[] {
+  const where: string[] = []
+  const params: unknown[] = []
+  if (filters.agentId) { where.push("agent_id = ?"); params.push(filters.agentId) }
+  if (filters.channel) { where.push("channel = ?"); params.push(filters.channel) }
+  if (filters.chatId) { where.push("chat_id = ?"); params.push(filters.chatId) }
+  if (filters.workflowRunId) { where.push("workflow_run_id = ?"); params.push(filters.workflowRunId) }
+  if (filters.status) { where.push("status = ?"); params.push(filters.status) }
+  if (filters.since !== undefined) { where.push("started_at >= ?"); params.push(filters.since) }
+  if (filters.until !== undefined) { where.push("started_at <= ?"); params.push(filters.until) }
+
+  const limit = Math.max(1, Math.min(filters.limit ?? 100, 1000))
+  const sql = `
+    SELECT * FROM task_traces
+    ${where.length > 0 ? "WHERE " + where.join(" AND ") : ""}
+    ORDER BY started_at DESC
+    LIMIT ?
+  `
+  params.push(limit)
+  return (db.prepare(sql).all(...params) as Record<string, unknown>[]).map(rowToTrace)
+}
